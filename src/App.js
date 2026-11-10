@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
 
-const API =  "http://127.0.0.1:5000/api";
+const API = "https://supplychain-backend-p0em.onrender.com/api";
 
 const fontLink = document.createElement("link");
 fontLink.rel = "stylesheet";
