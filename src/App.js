@@ -212,7 +212,7 @@ const CAT_GRAD = {
   "Máy móc":"#DA251D,#FFE082", "Nguyên liệu":"#FFE082,#DA251D", "Linh kiện":"#FFCD00,#DA251D", "Bao bì":"#FF8F00,#FFCD00",
   Machinery:"#DA251D,#FFE082", "Raw Materials":"#FFE082,#DA251D", Components:"#FFCD00,#DA251D", Packaging:"#FF8F00,#FFCD00",
 };
-const STATUS_VI = { Accepted: "Đã duyệt", Pending: "Chờ duyệt", Rejected: "Từ chối" };
+const STATUS_VI = { Accepted: "Đã duyệt", Pending: "Chờ duyệt", Rejected: "Từ chối", Cancelled: "Đã hủy" };
 
 const GlassCard   = ({ children, style:s={}, gradient }) => (
   <div className="glass" style={{ padding:24, position:"relative", overflow:"hidden", ...s }}>
@@ -229,6 +229,12 @@ const Card3D = ({ children, style:s={}, gradient }) => (
 const GlassInput  = (props) => <input className="glass-input" {...props} />;
 const GlassSelect = ({ children, ...props }) => <select className="glass-input" {...props}>{children}</select>;
 const Label       = ({ children }) => <label style={{ fontSize:11, color:"#6B7280", letterSpacing:0.6, display:"block", marginBottom:6, fontWeight:600 }}>{children}</label>;
+const ProfileRow  = ({ label, value }) => (
+  <div>
+    <Label>{label}</Label>
+    <div style={{ padding:"10px 14px", background:"#F9FAFB", border:"1px solid #E5E7EB", borderRadius:8, fontSize:14, color:"#1F2937" }}>{value || "—"}</div>
+  </div>
+);
 const IdBadge     = ({ id }) => <span style={{ background:"#FEF2F2", color:"#DA251D", border:"1px solid #FECACA", borderRadius:6, padding:"2px 8px", fontSize:11, fontWeight:600 }}>{id}</span>;
 const Spinner     = () => <div className="spinner" />;
 
@@ -339,6 +345,7 @@ const StatusBadge = ({ status }) => {
     Accepted: { bg:"#DCFCE7", color:"#166534", border:"1px solid #BBF7D0" },
     Pending:  { bg:"#FEF3C7", color:"#92400E", border:"1px solid #FDE68A" },
     Rejected: { bg:"#FEE2E2", color:"#991B1B", border:"1px solid #FECACA" },
+    Cancelled:{ bg:"#F3F4F6", color:"#374151", border:"1px solid #D1D5DB" },
   };
   const st = styles[s] || styles.Accepted;
   return (
@@ -731,6 +738,11 @@ const CustomerPortal = ({ onBack }) => {
   const [loadingProducts, setLoadingProducts] = useState(false);
   const [loadingOrders, setLoadingOrders]     = useState(false);
   const [requesting, setRequesting]           = useState(null);
+  const [stock, setStock]                     = useState({});
+  const [qtyById, setQtyById]                 = useState({});
+  const [profileForm, setProfileForm]         = useState({ ContactNumber:"", Address:"" });
+  const [savingProfile, setSavingProfile]     = useState(false);
+  const [cancelling, setCancelling]           = useState(null);
 
   const handleLogin = async () => {
     if (!customerId.trim()) { setLoginErr("Vui lòng nhập mã khách hàng."); return; }
@@ -754,7 +766,16 @@ const CustomerPortal = ({ onBack }) => {
 
   const loadProducts = () => {
     setLoadingProducts(true);
-    apiFetch('/products').then(p => { setProducts(p); setLoadingProducts(false); })
+    Promise.all([apiFetch('/products'), apiFetch('/inventory')])
+      .then(([p, inv]) => {
+        setProducts(p);
+        const stockMap = {};
+        inv.forEach(i => {
+          stockMap[i.ProductID] = (stockMap[i.ProductID] || 0) + (parseInt(i.QuantityAvailable, 10) || 0);
+        });
+        setStock(stockMap);
+        setLoadingProducts(false);
+      })
       .catch(e => { showToast(e.message || "Không tải được sản phẩm.", "error"); setLoadingProducts(false); });
   };
 
@@ -776,16 +797,25 @@ const CustomerPortal = ({ onBack }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    if (customer) {
+      setProfileForm({ ContactNumber: customer.ContactNumber || "", Address: customer.Address || "" });
+    }
+  }, [customer]);
+
   const requestProduct = async (product) => {
+    const qty = Math.max(1, parseInt(qtyById[product.ProductID] || 1, 10) || 1);
+    const available = stock[product.ProductID] || 0;
+    if (available < 1) {
+      showToast(`Sản phẩm "${product.ProductName}" đã hết hàng.`, "error");
+      return;
+    }
+    if (qty > available) {
+      showToast(`Sản phẩm "${product.ProductName}" chỉ còn ${available} ${unitVi(product)}.`, "error");
+      return;
+    }
     setRequesting(product.ProductID);
     try {
-      const inv = await apiFetch('/inventory');
-      const total = inv.filter(i => i.ProductID === product.ProductID).reduce((a, i) => a + i.QuantityAvailable, 0);
-      if (total < 1) {
-        showToast(`Sản phẩm "${product.ProductName}" đã hết hàng.`, "error");
-        setRequesting(null);
-        return;
-      }
       const orders = await apiFetch('/orders');
       // Find the highest existing order number and increment it to avoid duplicates
       const maxNum = orders.reduce((max, o) => {
@@ -796,19 +826,53 @@ const CustomerPortal = ({ onBack }) => {
       await apiPost('/orders', {
         OrderID: newId,
         OrderDate: new Date().toISOString().split("T")[0],
-        Bill: parseFloat(product.UnitPrice),
+        Bill: parseFloat(product.UnitPrice) * qty,
         CustomerID: customer.CustomerID,
         ProductID: product.ProductID,
-        Quantity: 1,
+        Quantity: qty,
         Status: "Pending",
       });
-      showToast(`Đã gửi yêu cầu "${product.ProductName}"! Admin sẽ xem xét.`);
+      showToast(`Đã gửi yêu cầu ${qty} "${product.ProductName}"! Admin sẽ xem xét.`);
+      setQtyById(q => ({ ...q, [product.ProductID]: 1 }));
       loadOrders(customer.CustomerID);
       setTab("orders");
     } catch (e) {
       showToast(e.message || "Gửi yêu cầu thất bại. Vui lòng thử lại.", "error");
     }
     setRequesting(null);
+  };
+
+  const saveProfile = async () => {
+    const contactNumber = profileForm.ContactNumber.trim();
+    const address = profileForm.Address.trim();
+    if (!contactNumber || !address) {
+      showToast("Vui lòng nhập đầy đủ số điện thoại và địa chỉ.", "error");
+      return;
+    }
+    setSavingProfile(true);
+    try {
+      await apiPut(`/customers/${customer.CustomerID}`, { ContactNumber: contactNumber, Address: address });
+      const updated = { ...customer, ContactNumber: contactNumber, Address: address };
+      setCustomer(updated);
+      localStorage.setItem(CUSTOMER_KEY, JSON.stringify(updated));
+      showToast("Đã cập nhật hồ sơ cá nhân.");
+    } catch (e) {
+      showToast(e.message || "Cập nhật hồ sơ thất bại.", "error");
+    }
+    setSavingProfile(false);
+  };
+
+  const cancelOrder = async (order) => {
+    if (!window.confirm(`Bạn chắc chắn muốn hủy đơn ${order.OrderID}?`)) return;
+    setCancelling(order.OrderID);
+    try {
+      await apiPatch(`/orders/${order.OrderID}/status`, { Status: "Cancelled" });
+      showToast(`Đã hủy đơn ${order.OrderID}.`);
+      loadOrders(customer.CustomerID);
+    } catch (e) {
+      showToast(e.message || "Không hủy được đơn hàng.", "error");
+    }
+    setCancelling(null);
   };
 
   const catGrad = CAT_GRAD;
@@ -887,6 +951,11 @@ const CustomerPortal = ({ onBack }) => {
           <div style={{ fontFamily:"var(--font-head)", fontSize:26, fontWeight:700, marginBottom:6 }}>
             Chào mừng trở lại, {customer?.CustomerName?.split(" ")[0]}! 👋
           </div>
+          <div style={{ color:"var(--muted)", fontSize:13, marginBottom:6 }}>
+            {customer?.CustomerType === "Business"
+              ? <>🏢 Tài khoản Doanh nghiệp · MST: {customer?.TaxCode || "—"}</>
+              : <>👤 Tài khoản Cá nhân</>}
+          </div>
           <div style={{ color:"var(--muted)", fontSize:14 }}>Duyệt sản phẩm và gửi yêu cầu — yêu cầu của bạn sẽ được gửi trực tiếp đến đội ngũ của chúng tôi.</div>
         </div>
 
@@ -894,6 +963,7 @@ const CustomerPortal = ({ onBack }) => {
           {[
             { id:"products", label:"🛍 Duyệt sản phẩm" },
             { id:"orders",   label:`📋 Đơn hàng của tôi ${myOrders.length > 0 ? `(${myOrders.length})` : ""}` },
+            { id:"profile",  label:"👤 Hồ sơ cá nhân" },
           ].map(t => (
             <button key={t.id} onClick={() => { setTab(t.id); if(t.id==="orders") loadOrders(customer.CustomerID); }}
               className={tab === t.id ? "btn-primary" : "btn-ghost"}
@@ -914,6 +984,10 @@ const CustomerPortal = ({ onBack }) => {
                 {products.map((p, i) => {
                   const grad = catGrad[p.Category] || grads[i % 6];
                   const isRequesting = requesting === p.ProductID;
+                  const available = stock[p.ProductID] || 0;
+                  const outOfStock = available < 1;
+                  const qty = Math.max(1, parseInt(qtyById[p.ProductID] || 1, 10) || 1);
+                  const lineTotal = (parseFloat(p.UnitPrice) || 0) * qty;
                   return (
                     <div key={p.ProductID} className="glass" style={{ padding:22, position:"relative", overflow:"hidden", transition:"border-color 0.2s", borderRadius:12, border:"1px solid #E5E7EB", background:"#FFFFFF", boxShadow:"0 1px 3px rgba(0,0,0,0.08)" }}>
                       <div style={{ position:"absolute", top:0, left:0, right:0, height:3, background:`${grad.split(",")[0]}`, borderRadius:"12px 12px 0 0" }} />
@@ -922,19 +996,43 @@ const CustomerPortal = ({ onBack }) => {
                         <span style={{ background:"#F3F4F6", color:"#6B7280", border:"1px solid #E5E7EB", padding:"3px 10px", borderRadius:6, fontSize:11 }}>{catVi(p.Category)}</span>
                       </div>
                       <div style={{ fontFamily:"var(--font-head)", fontSize:17, fontWeight:600, marginBottom:8, lineHeight:1.3 }}>{p.ProductName}</div>
-                      <div style={{ fontFamily:"var(--font-head)", fontSize:24, fontWeight:700, color:"#1F2937", marginBottom:18 }}>
+                      <div style={{ fontFamily:"var(--font-head)", fontSize:24, fontWeight:700, color:"#1F2937", marginBottom:4 }}>
                         {fmtVnd(p.UnitPrice)}
+                      </div>
+                      <div style={{ fontSize:12, color: outOfStock ? "#B91C1C" : "#6B7280", marginBottom:14 }}>
+                        {outOfStock ? "Hết hàng" : `Còn ${available} ${unitVi(p)}`}
+                      </div>
+                      <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:10 }}>
+                        <span style={{ fontSize:12, color:"#6B7280", whiteSpace:"nowrap" }}>Số lượng</span>
+                        <input
+                          type="number"
+                          min={1}
+                          max={outOfStock ? undefined : available}
+                          value={qty}
+                          disabled={outOfStock || isRequesting}
+                          onChange={e => {
+                            const v = Math.max(1, parseInt(e.target.value, 10) || 1);
+                            setQtyById(q => ({ ...q, [p.ProductID]: outOfStock ? 1 : Math.min(v, available) }));
+                          }}
+                          className="glass-input"
+                          style={{ width:80, padding:"8px 10px", fontSize:13 }}
+                        />
+                      </div>
+                      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14, fontSize:13 }}>
+                        <span style={{ color:"#6B7280" }}>Tổng tiền tạm tính</span>
+                        <span style={{ fontWeight:700, color:"#1F2937" }}>{fmtVnd(lineTotal)}</span>
                       </div>
                       <button
                         onClick={() => requestProduct(p)}
-                        disabled={isRequesting}
+                        disabled={isRequesting || outOfStock}
                         style={{
                           width:"100%", padding:"10px", fontSize:13, fontWeight:600,
-                          background: isRequesting ? "#F3F4F6" : "#DA251D",
-                          border:"none", borderRadius:8, color: isRequesting ? "#9CA3AF" : "#fff", cursor: isRequesting ? "not-allowed" : "pointer",
+                          background: (isRequesting || outOfStock) ? "#F3F4F6" : "#DA251D",
+                          border:"none", borderRadius:8, color: (isRequesting || outOfStock) ? "#9CA3AF" : "#fff",
+                          cursor: (isRequesting || outOfStock) ? "not-allowed" : "pointer",
                           fontFamily:"var(--font-body)", transition:"background 0.2s"
                         }}>
-                        {isRequesting ? "Đang gửi yêu cầu..." : "Yêu cầu sản phẩm này →"}
+                        {outOfStock ? "Hết hàng" : isRequesting ? "Đang gửi yêu cầu..." : "Yêu cầu sản phẩm này →"}
                       </button>
                     </div>
                   );
@@ -965,12 +1063,12 @@ const CustomerPortal = ({ onBack }) => {
             ) : (
               <GlassCard style={{ padding:0, overflow:"hidden" }}>
                 <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
-                  <TableHeader cols={["Mã đơn","Sản phẩm","Ngày","Số tiền","Trạng thái"]} />
+                  <TableHeader cols={["Mã đơn","Sản phẩm","Ngày","Số tiền","Trạng thái","Thao tác"]} />
                   <tbody>
                     {myOrders.map(o => (
                       <tr key={o.OrderID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
                         <td style={{ padding:"12px 16px" }}><IdBadge id={o.OrderID} /></td>
-                        <td style={{ padding:"12px 16px", fontWeight:600 }}>{o.productName}</td>
+                        <td style={{ padding:"12px 16px", fontWeight:600 }}>{o.productName}{o.Quantity > 1 ? ` × ${o.Quantity}` : ""}</td>
                         <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{o.OrderDate}</td>
                         <td style={{ padding:"12px 16px", fontWeight:700, color:"#1F2937" }}>
                           {fmtVnd(o.Bill)}
@@ -980,6 +1078,20 @@ const CustomerPortal = ({ onBack }) => {
                           {o.Status === "Pending" && <div style={{ fontSize:10, color:"var(--muted)", marginTop:4 }}>Đang chờ duyệt</div>}
                           {o.Status === "Accepted" && <div style={{ fontSize:10, color:"#166534", marginTop:4 }}>Yêu cầu đã được chấp nhận!</div>}
                           {o.Status === "Rejected" && <div style={{ fontSize:10, color:"#991B1B", marginTop:4 }}>Yêu cầu đã bị từ chối</div>}
+                          {o.Status === "Cancelled" && <div style={{ fontSize:10, color:"#6B7280", marginTop:4 }}>Đơn hàng đã được hủy</div>}
+                        </td>
+                        <td style={{ padding:"12px 16px" }}>
+                          {o.Status === "Pending" ? (
+                            <button
+                              className="btn-danger"
+                              onClick={() => cancelOrder(o)}
+                              disabled={cancelling === o.OrderID}
+                              style={{ padding:"5px 12px", fontSize:12 }}>
+                              {cancelling === o.OrderID ? "Đang hủy..." : "Hủy đơn"}
+                            </button>
+                          ) : (
+                            <span style={{ color:"var(--muted-2)", fontSize:12 }}>—</span>
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -987,6 +1099,36 @@ const CustomerPortal = ({ onBack }) => {
                 </table>
               </GlassCard>
             )}
+          </div>
+        )}
+
+        {tab === "profile" && (
+          <div className="fade-up">
+            <GlassCard style={{ maxWidth:640 }}>
+              <div style={{ fontFamily:"var(--font-head)", fontSize:18, fontWeight:600, marginBottom:20 }}>Hồ sơ cá nhân</div>
+              <div style={{ display:"grid", gap:14 }}>
+                <ProfileRow label="MÃ KHÁCH HÀNG" value={customer?.CustomerID} />
+                <ProfileRow label="TÊN KHÁCH HÀNG" value={customer?.CustomerName} />
+                <div>
+                  <Label>SỐ ĐIỆN THOẠI</Label>
+                  <GlassInput value={profileForm.ContactNumber} onChange={e => setProfileForm({ ...profileForm, ContactNumber: e.target.value })} />
+                </div>
+                <div>
+                  <Label>ĐỊA CHỈ</Label>
+                  <GlassInput value={profileForm.Address} onChange={e => setProfileForm({ ...profileForm, Address: e.target.value })} />
+                </div>
+                <ProfileRow label="LOẠI KHÁCH HÀNG" value={customer?.CustomerType === "Business" ? "Doanh nghiệp" : "Cá nhân"} />
+                <ProfileRow label="MÃ SỐ THUẾ" value={customer?.TaxCode} />
+                <div style={{ display:"flex", gap:10, marginTop:6 }}>
+                  <button className="btn-primary" onClick={saveProfile} disabled={savingProfile}>
+                    {savingProfile ? "Đang lưu..." : "Lưu thay đổi"}
+                  </button>
+                  <button className="btn-ghost" onClick={() => setProfileForm({ ContactNumber: customer?.ContactNumber || "", Address: customer?.Address || "" })}>
+                    Hoàn tác
+                  </button>
+                </div>
+              </div>
+            </GlassCard>
           </div>
         )}
       </div>
@@ -1696,7 +1838,7 @@ const Orders = ({ refreshPending }) => {
       <PageHeader crumb="ĐƠN HÀNG" title="Đơn hàng" sub={`${data.length} tổng đơn hàng${pendingCount > 0 ? ` · ${pendingCount} chờ duyệt` : ''}`} />
 
       <div style={{ display:"flex", gap:8, marginBottom:16 }}>
-        {["All","Accepted","Pending","Rejected"].map(f => (
+        {["All","Accepted","Pending","Rejected","Cancelled"].map(f => (
           <button key={f} onClick={()=>setStatusFilter(f)}
             className={statusFilter===f ? "btn-primary" : "btn-ghost"}
             style={{ padding:"7px 16px", fontSize:13 }}>
