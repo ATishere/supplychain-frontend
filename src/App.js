@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
 
-const API = "https://supplychain-backend-p0em.onrender.com/api";
+const API =  "http://127.0.0.1:5000/api";
 
 const fontLink = document.createElement("link");
 fontLink.rel = "stylesheet";
@@ -104,6 +104,61 @@ globalStyle.textContent = `
 document.head.appendChild(globalStyle);
 
 const getToken = () => localStorage.getItem("token");
+const AUTH_KEY = "auth";
+const CUSTOMER_KEY = "customer";
+
+const decodeJwt = (token) => {
+  try {
+    const base64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    return JSON.parse(decodeURIComponent(escape(atob(base64))));
+  } catch { return null; }
+};
+const tokenExpired = (token) => {
+  const p = decodeJwt(token);
+  if (!p || !p.exp) return false;
+  return p.exp * 1000 <= Date.now();
+};
+const hasValidToken = () => {
+  const t = getToken();
+  if (!t) return false;
+  if (tokenExpired(t)) {
+    localStorage.removeItem("token");
+    localStorage.removeItem(AUTH_KEY);
+    localStorage.removeItem(CUSTOMER_KEY);
+    return false;
+  }
+  return true;
+};
+const setAuth = (screen, extra = {}) => {
+  const p = decodeJwt(getToken()) || {};
+  const auth = {
+    screen,
+    username: extra.username || p.username || p.sub || "",
+    role: extra.role || p.role || "admin",
+  };
+  localStorage.setItem(AUTH_KEY, JSON.stringify(auth));
+  return auth;
+};
+const getAuth = () => {
+  try { return JSON.parse(localStorage.getItem(AUTH_KEY)) || null; }
+  catch { return null; }
+};
+const clearAuth = () => {
+  localStorage.removeItem(AUTH_KEY);
+  localStorage.removeItem(CUSTOMER_KEY);
+};
+const bootstrapAuth = () => {
+  if (!hasValidToken()) return { screen: "landing", user: null };
+  const auth = getAuth() || {};
+  const p = decodeJwt(getToken()) || {};
+  const user = {
+    username: auth.username || p.username || p.sub || "admin",
+    role: auth.role || p.role || "admin",
+  };
+  const screen = ["app", "login", "customer"].includes(auth.screen) ? auth.screen : "app";
+  return { screen, user };
+};
+
 const authHeaders = (extra = {}) => {
   const t = getToken();
   return { ...(t ? { Authorization: `Bearer ${t}` } : {}), ...extra };
@@ -129,6 +184,7 @@ const request = (path, method = "GET", body) =>
   }).then(async (r) => {
     if (r.status === 401 && !path.startsWith("/auth/")) {
       localStorage.removeItem("token");
+      clearAuth();
       window.location.reload();
       throw new Error("Phiên đăng nhập hết hạn. Vui lòng đăng nhập lại.");
     }
@@ -143,6 +199,14 @@ const apiPatch = (path, body) => request(path, "PATCH", body);
 const fmtVnd = (n) => `${(parseFloat(n) || 0).toLocaleString("vi-VN")} ₫`;
 const CAT_VI = { Machinery: "Máy móc", "Raw Materials": "Nguyên liệu", Components: "Linh kiện", Packaging: "Bao bì" };
 const catVi = (c) => CAT_VI[c] || c || "—";
+const UNIT_BY_CAT = {
+  "Máy móc":"Chiếc", "Nguyên liệu":"Bao", "Bao bì":"Thùng", "Linh kiện":"Bộ",
+  Machinery:"Chiếc", "Raw Materials":"Bao", Packaging:"Thùng", Components:"Bộ",
+};
+const unitVi = (p) => {
+  const u = String(p?.Unit || "").trim();
+  return u && u.toLowerCase() !== "u" ? u : (UNIT_BY_CAT[p?.Category] || "Cái");
+};
 const CATS = ["Máy móc", "Nguyên liệu", "Bao bì", "Linh kiện"];
 const CAT_GRAD = {
   "Máy móc":"#DA251D,#FFE082", "Nguyên liệu":"#FFE082,#DA251D", "Linh kiện":"#FFCD00,#DA251D", "Bao bì":"#FF8F00,#FFCD00",
@@ -300,10 +364,23 @@ const InvoiceModal = ({ order, customer, product, onClose }) => {
     const iframe = document.createElement("iframe");
     iframe.style.cssText = "position:fixed;top:-9999px;left:-9999px;width:900px;height:1200px;border:none;";
     document.body.appendChild(iframe);
-    const doc = iframe.contentWindow.document;
-    doc.open();
-    doc.write("<!DOCTYPE html><html><head><meta charset='utf-8'/><link rel='stylesheet' href='https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap'/><style>*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}body{background:#fff;font-family:'Be Vietnam Pro',Georgia,sans-serif;color:#111;}@page{margin:15mm;}</style></head><body>" + content.innerHTML + "</body></html>");
-    doc.close();
+    // VULN-12 fix: use srcdoc + cloneNode instead of doc.write(innerHTML)
+    // so no raw HTML from API data is injected via string concatenation.
+    const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+    iframeDoc.open();
+    iframeDoc.write(
+      "<!DOCTYPE html><html><head><meta charset='utf-8'/>" +
+      "<link rel='stylesheet' href='https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700;800&display=swap'/>" +
+      "<style>*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}body{background:#fff;font-family:'Be Vietnam Pro',Georgia,sans-serif;color:#111;}@page{margin:15mm;}</style>" +
+      "</head><body></body></html>"
+    );
+    iframeDoc.close();
+    // Clone the DOM node — this preserves React-escaped text nodes and
+    // never re-executes event handlers or script tags.
+    const clone = content.cloneNode(true);
+    // Strip any <script> elements that might have been injected
+    clone.querySelectorAll("script").forEach(s => s.remove());
+    iframeDoc.body.appendChild(clone);
     iframe.onload = () => { setTimeout(() => { iframe.contentWindow.focus(); iframe.contentWindow.print(); setTimeout(() => document.body.removeChild(iframe), 1500); }, 500); };
   };
 
@@ -571,7 +648,6 @@ const LandingPage = ({ onEnter }) => {
           <h2 style={{ fontFamily:"var(--font-head)", fontSize:"clamp(26px,4vw,44px)", fontWeight:700, marginBottom:16 }}>Sẵn sàng quản lý chuỗi cung ứng?</h2>
           <p style={{ color:"var(--muted)", fontSize:15, marginBottom:36, maxWidth:480, margin:"0 auto 36px" }}>Đăng nhập để trải nghiệm sức mạnh của hệ thống quản lý chuỗi cung ứng toàn diện.</p>
           <button className="btn-primary" onClick={onEnter} style={{ padding:"14px 40px", fontSize:16, borderRadius:8 }}>Vào bảng tổng quan →</button>
-          <div style={{ marginTop:18, fontSize:12, color:"var(--muted)" }}>Tài khoản demo: <span style={{ color:"#B45309" }}>admin / admin123</span></div>
         </div>
       </section>
 
@@ -598,6 +674,7 @@ const LoginPage = ({ onLogin, onCustomerPortal }) => {
     try {
       const res = await request("/auth/login", "POST", { username: form.username, password: form.password });
       localStorage.setItem("token", res.access_token);
+      setAuth("app", { username: form.username });
       onLogin();
     } catch (e) {
       setErr(e.message || "Đăng nhập thất bại. Thử admin / admin123");
@@ -620,7 +697,6 @@ const LoginPage = ({ onLogin, onCustomerPortal }) => {
           <div style={{ marginBottom:22 }}><Label>MẬT KHẨU</Label><GlassInput type="password" placeholder="••••••••" value={form.password} onChange={e=>setForm({...form,password:e.target.value})} onKeyDown={e=>e.key==="Enter"&&handle()} /></div>
           {err && <div style={{ background:"#FEF2F2", border:"1px solid #FECACA", borderRadius:8, padding:"10px 14px", color:"#B91C1C", fontSize:13, marginBottom:16 }}>{err}</div>}
           <button className="btn-primary" onClick={handle} style={{ width:"100%", padding:"13px", fontSize:15, borderRadius:8 }}>{loading?"Đang đăng nhập...":"Đăng nhập →"}</button>
-          <div style={{ textAlign:"center", marginTop:14, color:"var(--muted)", fontSize:12 }}>Tài khoản demo: admin / admin123</div>
 
           <div style={{ display:"flex", alignItems:"center", gap:12, margin:"22px 0 18px" }}>
             <div style={{ flex:1, height:1, background:"rgba(0,0,0,0.08)" }} />
@@ -639,10 +715,14 @@ const LoginPage = ({ onLogin, onCustomerPortal }) => {
 
 // ══ CUSTOMER PORTAL ══════════════════════════════════════════════════════════
 const CustomerPortal = ({ onBack }) => {
-  const [step, setStep]       = useState("login");
-  const [customerId, setCustomerId] = useState("");
+  const restoredCustomer = (() => {
+    try { return JSON.parse(localStorage.getItem(CUSTOMER_KEY)) || null; }
+    catch { return null; }
+  })();
+  const [step, setStep]       = useState(restoredCustomer ? "portal" : "login");
+  const [customerId, setCustomerId] = useState(restoredCustomer?.CustomerID || "");
   const [password, setPassword]     = useState("");
-  const [customer, setCustomer]     = useState(null);
+  const [customer, setCustomer]     = useState(restoredCustomer);
   const [loginErr, setLoginErr]     = useState("");
   const [loginLoading, setLoginLoading] = useState(false);
   const [tab, setTab]         = useState("products");
@@ -660,6 +740,8 @@ const CustomerPortal = ({ onBack }) => {
     try {
       const res = await request("/auth/customer-login", "POST", { customer_id: customerId.trim(), password });
       localStorage.setItem("token", res.access_token);
+      localStorage.setItem(CUSTOMER_KEY, JSON.stringify(res.customer));
+      setAuth("customer", { username: res.customer.CustomerID, role: "customer" });
       setCustomer(res.customer);
       setStep("portal");
       loadProducts();
@@ -685,6 +767,14 @@ const CustomerPortal = ({ onBack }) => {
       setLoadingOrders(false);
     }).catch(e => { showToast(e.message || "Không tải được đơn hàng.", "error"); setLoadingOrders(false); });
   };
+
+  useEffect(() => {
+    if (step === "portal" && customer) {
+      loadProducts();
+      loadOrders(customer.CustomerID);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const requestProduct = async (product) => {
     setRequesting(product.ProductID);
@@ -754,9 +844,6 @@ const CustomerPortal = ({ onBack }) => {
                 onKeyDown={e => e.key === "Enter" && handleLogin()}
                 style={{ fontSize:16, padding:"13px 16px" }}
               />
-              <div style={{ fontSize:11, color:"var(--muted)", marginTop:8 }}>
-                Tài khoản demo: C001 / customer123
-              </div>
             </div>
             {loginErr && (
               <div style={{ background:"#FEF2F2", border:"1px solid #FECACA", borderRadius:8, padding:"10px 14px", color:"#B91C1C", fontSize:13, marginBottom:16 }}>{loginErr}</div>
@@ -1197,7 +1284,7 @@ const Products = () => {
                 <div style={{ fontFamily:"var(--font-head)", fontSize:17, fontWeight:600, marginBottom:6 }}>{p.ProductName}</div>
                 <div style={{ fontSize:12, color:"var(--muted)", marginBottom:4 }}>🏭 {sup?.SupplierName || p.SupplierID}</div>
                 <div style={{ fontSize:11, color:"var(--muted)", marginBottom:16 }}>
-                  📦 Đơn vị: {p.Unit || "Cái"} · 🌍 {p.Origin || "Việt Nam"}
+                  📦 Đơn vị: {unitVi(p)} · 🌍 {p.Origin || "Việt Nam"}
                 </div>
                 <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
                   <span style={{ fontFamily:"var(--font-head)", fontSize:22, fontWeight:700, color:"#1F2937" }}>{fmtVnd(p.UnitPrice)}</span>
@@ -1310,7 +1397,7 @@ const Warehouses = () => {
                   </div>
                 </div>
                 <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:16 }}>
-                  {[["Sức chứa",`${w.Capacity.toLocaleString()} u`],["Tồn kho",`${used.toLocaleString()} u`]].map(([l,v])=>(
+                  {[["Sức chứa",`${w.Capacity.toLocaleString()} Tấn`],["Tồn kho",`${used.toLocaleString()} Tấn`]].map(([l,v])=>(
                     <div key={l} className="glass" style={{ padding:"10px 12px", borderRadius:10 }}>
                       <div style={{ fontSize:10, color:"var(--muted)", letterSpacing:1, marginBottom:4 }}>{l.toUpperCase()}</div>
                       <div style={{ fontSize:13, fontWeight:600 }}>{v}</div>
@@ -1574,8 +1661,11 @@ const Orders = ({ refreshPending }) => {
 
   const save = async () => {
     try {
-      if (modal==="add") await apiPost('/orders', {...form, Status: form.Status||"Accepted"});
-      else await apiPut(`/orders/${form.OrderID}`, {...form, Status: form.Status||"Accepted"});
+      if (modal==="add") await apiPost('/orders', {...form, Status: "Pending"});
+      else {
+        const { Status, ...updatePayload } = form;
+        await apiPut(`/orders/${form.OrderID}`, updatePayload);
+      }
       showToast(modal==="add" ? `Đã tạo đơn hàng "${form.OrderID}"!` : `Cập nhật đơn hàng thành công.`);
       setModal(null); load();
     } catch (e) { showToast(e.message || 'Lưu đơn hàng thất bại.', 'error'); }
@@ -1710,11 +1800,9 @@ const Orders = ({ refreshPending }) => {
             }} /></div>
             <div><Label>SỐ TIỀN (VNĐ)</Label><GlassInput type="number" value={form.Bill||0} onChange={e=>setForm({...form,Bill:+e.target.value})} /></div>
             <div><Label>TRẠNG THÁI</Label>
-              <GlassSelect value={form.Status||"Accepted"} onChange={e=>setForm({...form,Status:e.target.value})} style={{width:"100%"}}>
-                <option value="Accepted">Đã duyệt</option>
-                <option value="Pending">Chờ duyệt</option>
-                <option value="Rejected">Từ chối</option>
-              </GlassSelect>
+              <div style={{ padding: "9px 12px", borderRadius: 8, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", fontSize: 13, color: "var(--muted)" }}>
+                {STATUS_VI[form.Status] || form.Status || "Chờ duyệt"} <span style={{ fontSize: 11, color: '#B45309', marginLeft: 6 }}>(Duyệt qua danh sách)</span>
+              </div>
             </div>
             <div style={{ display:"flex", gap:10, marginTop:4 }}>
               <button className="btn-primary" onClick={save}>Lưu đơn hàng</button>
@@ -1762,7 +1850,9 @@ const NAV = [
 const PAGES = { dashboard:Dashboard, suppliers:Suppliers, products:Products, warehouses:Warehouses, inventory:Inventory, customers:Customers, orders:Orders };
 
 export default function App() {
-  const [screen, setScreen] = useState("landing");
+  const initial = bootstrapAuth();
+  const [screen, setScreen] = useState(initial.screen);
+  const [user, setUser]         = useState(initial.user);
   const [page, setPage]     = useState("dashboard");
   const [pendingCount, setPendingCount] = useState(0);
 
@@ -1776,11 +1866,29 @@ export default function App() {
     if (screen === "app") refreshPending();
   }, [screen, page, refreshPending]);
 
+  const handleLogin = (authUser) => {
+    setUser(authUser || { username: "admin", role: "admin" });
+    setScreen("app");
+  };
+
+  const handleLogout = async (targetScreen = "landing") => {
+    try {
+      await request("/auth/logout", "POST");
+    } catch {}
+    localStorage.removeItem("token");
+    clearAuth();
+    setUser(null);
+    setScreen(targetScreen);
+  };
+
   if (screen === "landing") return <LandingPage onEnter={() => setScreen("login")}/>;
-  if (screen === "login")   return <LoginPage onLogin={() => setScreen("app")} onCustomerPortal={() => setScreen("customer")} />;
-  if (screen === "customer") return <><ToastContainer/><CustomerPortal onBack={() => { localStorage.removeItem("token"); setScreen("login"); }} /></>;
+  if (screen === "login")   return <LoginPage onLogin={handleLogin} onCustomerPortal={() => setScreen("customer")} />;
+  if (screen === "customer") return <><ToastContainer/><CustomerPortal onBack={() => handleLogout("login")} /></>;
 
   const Page = PAGES[page];
+  const displayName = user?.username || "admin";
+  const displayRole = user?.role === "customer" ? "Khách hàng" : "Administrator";
+  const displayEmail = `${displayName}@supplychain7vn.vn`;
   return (
     <>
       <ToastContainer />
@@ -1810,8 +1918,8 @@ export default function App() {
           </nav>
           <div style={{ padding:"16px 18px", borderTop:"1px solid #E5E7EB", display:"flex", alignItems:"center", gap:10 }}>
             <div style={{ width:36, height:36, background:"#DA251D", borderRadius:10, display:"flex", alignItems:"center", justifyContent:"center", fontSize:16, flexShrink:0 }}>👤</div>
-            <div><div style={{ fontSize:14, fontWeight:600 }}>Admin</div><div style={{ fontSize:10, color:"var(--muted)" }}>admin@supplychain7vn.vn</div></div>
-            <button onClick={()=>{localStorage.removeItem("token");setScreen("landing");}} style={{ marginLeft:"auto", background:"#FFFFFF", border:"1px solid #FECACA", color:"#B91C1C", cursor:"pointer", borderRadius:8, width:30, height:30, fontSize:14, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>⏻</button>
+            <div><div style={{ fontSize:14, fontWeight:600 }}>{displayName}</div><div style={{ fontSize:10, color:"var(--muted)" }}>{displayRole} · {displayEmail}</div></div>
+            <button onClick={() => handleLogout("landing")} style={{ marginLeft:"auto", background:"#FFFFFF", border:"1px solid #FECACA", color:"#B91C1C", cursor:"pointer", borderRadius:8, width:30, height:30, fontSize:14, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>⏻</button>
           </div>
         </div>
         <div style={{ marginLeft:230, flex:1, padding:36, background:"#F5F7FA", maxWidth:"calc(100vw - 230px)", minHeight:"100vh" }}>
