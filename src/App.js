@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { CSVLink } from "react-csv";
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
 
-const API = "https://supplychain-backend-p0em.onrender.com/api";
+const API = process.env.REACT_APP_API_URL || "http://localhost:5000/api";
 
 const fontLink = document.createElement("link");
 fontLink.rel = "stylesheet";
@@ -212,7 +213,11 @@ const CAT_GRAD = {
   "Máy móc":"#DA251D,#FFE082", "Nguyên liệu":"#FFE082,#DA251D", "Linh kiện":"#FFCD00,#DA251D", "Bao bì":"#FF8F00,#FFCD00",
   Machinery:"#DA251D,#FFE082", "Raw Materials":"#FFE082,#DA251D", Components:"#FFCD00,#DA251D", Packaging:"#FF8F00,#FFCD00",
 };
-const STATUS_VI = { Accepted: "Đã duyệt", Pending: "Chờ duyệt", Rejected: "Từ chối", Cancelled: "Đã hủy" };
+const STATUS_VI = {
+  Accepted: "Đã duyệt", Pending: "Chờ duyệt", Rejected: "Từ chối", Cancelled: "Đã hủy",
+  Ordered: "Đã đặt", Received: "Đã nhận", Draft: "Nháp", Pending_Approval: "Chờ duyệt",
+  Approved: "Đã duyệt", In_Progress: "Đang kiểm", Completed: "Hoàn tất",
+};
 
 const GlassCard   = ({ children, style:s={}, gradient }) => (
   <div className="glass" style={{ padding:24, position:"relative", overflow:"hidden", ...s }}>
@@ -317,9 +322,9 @@ const TableHeader = ({ cols }) => (
   </thead>
 );
 
-const Modal = ({ title, onClose, children }) => (
+const Modal = ({ title, onClose, children, wide }) => (
   <div style={{ position:"fixed", inset:0, background:"rgba(17,24,39,0.5)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1000 }}>
-    <div className="glass fade-up" style={{ padding:28, width:620, maxWidth:"95vw", borderRadius:12 }}>
+    <div className="glass fade-up" style={{ padding:28, width: wide ? 900 : 620, maxWidth:"95vw", maxHeight:"90vh", overflowY:"auto", borderRadius:12 }}>
       <div style={{ display:"flex", justifyContent:"space-between", marginBottom:22 }}>
         <span style={{ fontFamily:"var(--font-head)", fontSize:20, fontWeight:600 }}>{title}</span>
         <button onClick={onClose} style={{ background:"#FFFFFF", border:"1px solid #D1D5DB", color:"#6B7280", cursor:"pointer", borderRadius:8, width:32, height:32, fontSize:18, display:"flex", alignItems:"center", justifyContent:"center" }}>×</button>
@@ -344,12 +349,28 @@ const StatusBadge = ({ status }) => {
   const styles = {
     Accepted: { bg:"#DCFCE7", color:"#166534", border:"1px solid #BBF7D0" },
     Pending:  { bg:"#FEF3C7", color:"#92400E", border:"1px solid #FDE68A" },
+    Pending_Approval: { bg:"#FEF3C7", color:"#92400E", border:"1px solid #FDE68A" },
     Rejected: { bg:"#FEE2E2", color:"#991B1B", border:"1px solid #FECACA" },
     Cancelled:{ bg:"#F3F4F6", color:"#374151", border:"1px solid #D1D5DB" },
+    Ordered:  { bg:"#DBEAFE", color:"#1D4ED8", border:"1px solid #BFDBFE" },
+    Received: { bg:"#DCFCE7", color:"#166534", border:"1px solid #BBF7D0" },
+    Draft:    { bg:"#F3F4F6", color:"#374151", border:"1px solid #D1D5DB" },
+    Approved: { bg:"#DCFCE7", color:"#166534", border:"1px solid #BBF7D0" },
+    In_Progress: { bg:"#DBEAFE", color:"#1D4ED8", border:"1px solid #BFDBFE" },
+    Completed:{ bg:"#DCFCE7", color:"#14532D", border:"1px solid #86EFAC" },
   };
   const st = styles[s] || styles.Accepted;
   return (
-    <span style={{ background:st.bg, color:st.color, border:st.border, padding:"3px 10px", borderRadius:6, fontSize:11, fontWeight:600 }}>{STATUS_VI[s] || s}</span>
+    <span style={{ background:st.bg, color:st.color, border:st.border, padding:"3px 10px", borderRadius:6, fontSize:11, fontWeight:600, whiteSpace:"nowrap" }}>{STATUS_VI[s] || s}</span>
+  );
+};
+
+const StarRating = ({ value }) => {
+  const rating = Math.max(0, Math.min(5, Math.round(Number(value) || 0)));
+  return (
+    <span title={`${Number(value) || 0}/5`} style={{ color:"#F59E0B", letterSpacing:1, whiteSpace:"nowrap" }}>
+      {"★".repeat(rating)}{"☆".repeat(5 - rating)}
+    </span>
   );
 };
 
@@ -743,6 +764,11 @@ const CustomerPortal = ({ onBack }) => {
   const [profileForm, setProfileForm]         = useState({ ContactNumber:"", Address:"" });
   const [savingProfile, setSavingProfile]     = useState(false);
   const [cancelling, setCancelling]           = useState(null);
+  const [returns, setReturns]                 = useState([]);
+  const [loadingReturns, setLoadingReturns]   = useState(false);
+  const [returnTarget, setReturnTarget]       = useState(null);
+  const [returnForm, setReturnForm]           = useState({ Quantity:1, Reason:"" });
+  const [submittingReturn, setSubmittingReturn] = useState(false);
   const inFlightRef = useRef(new Set());
 
   const handleLogin = async () => {
@@ -759,6 +785,7 @@ const CustomerPortal = ({ onBack }) => {
       setStep("portal");
       loadProducts();
       loadOrders(res.customer.CustomerID);
+      loadReturns();
     } catch (e) {
       setLoginErr(e.message || "Lỗi kết nối. Vui lòng thử lại.");
     }
@@ -790,10 +817,17 @@ const CustomerPortal = ({ onBack }) => {
     }).catch(e => { showToast(e.message || "Không tải được đơn hàng.", "error"); setLoadingOrders(false); });
   };
 
+  const loadReturns = () => {
+    setLoadingReturns(true);
+    apiFetch('/returns').then(d => { setReturns(d); setLoadingReturns(false); })
+      .catch(e => { showToast(e.message || "Không tải được yêu cầu trả hàng.", "error"); setLoadingReturns(false); });
+  };
+
   useEffect(() => {
     if (step === "portal" && customer) {
       loadProducts();
       loadOrders(customer.CustomerID);
+      loadReturns();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -867,6 +901,35 @@ const CustomerPortal = ({ onBack }) => {
       showToast(e.message || "Không hủy được đơn hàng.", "error");
     }
     setCancelling(null);
+  };
+
+  const openReturn = (order) => {
+    setReturnTarget(order);
+    setReturnForm({ Quantity: 1, Reason: "" });
+  };
+
+  const submitReturn = async () => {
+    const quantity = parseInt(returnForm.Quantity, 10);
+    if (!quantity || quantity < 1) { showToast("Số lượng trả hàng phải lớn hơn 0.", "error"); return; }
+    if (quantity > Number(returnTarget.Quantity || 1)) {
+      showToast(`Đơn hàng chỉ có ${returnTarget.Quantity} sản phẩm.`, "error"); return;
+    }
+    if (!returnForm.Reason.trim()) { showToast("Vui lòng nhập lý do trả hàng.", "error"); return; }
+    setSubmittingReturn(true);
+    try {
+      const res = await apiPost('/returns', {
+        OriginalOrderID: returnTarget.OrderID,
+        Quantity: quantity,
+        Reason: returnForm.Reason.trim(),
+      });
+      showToast(`Đã gửi yêu cầu trả hàng ${res.ReturnID}.`);
+      setReturnTarget(null);
+      loadReturns();
+      setTab("returns");
+    } catch (e) {
+      showToast(e.message || "Gửi yêu cầu trả hàng thất bại.", "error");
+    }
+    setSubmittingReturn(false);
   };
 
   const catGrad = CAT_GRAD;
@@ -957,9 +1020,10 @@ const CustomerPortal = ({ onBack }) => {
           {[
             { id:"products", label:"🛍 Duyệt sản phẩm" },
             { id:"orders",   label:`📋 Đơn hàng của tôi ${myOrders.length > 0 ? `(${myOrders.length})` : ""}` },
+            { id:"returns",  label:`↩ Yêu cầu trả hàng ${returns.length > 0 ? `(${returns.length})` : ""}` },
             { id:"profile",  label:"👤 Hồ sơ cá nhân" },
           ].map(t => (
-            <button key={t.id} onClick={() => { setTab(t.id); if(t.id==="orders") loadOrders(customer.CustomerID); }}
+            <button key={t.id} onClick={() => { setTab(t.id); if(t.id==="orders") loadOrders(customer.CustomerID); if(t.id==="returns") loadReturns(); }}
               className={tab === t.id ? "btn-primary" : "btn-ghost"}
               style={{ padding:"10px 22px", fontSize:14, borderRadius:8 }}>
               {t.label}
@@ -1083,10 +1147,53 @@ const CustomerPortal = ({ onBack }) => {
                               style={{ padding:"5px 12px", fontSize:12 }}>
                               {cancelling === o.OrderID ? "Đang hủy..." : "Hủy đơn"}
                             </button>
+                          ) : o.Status === "Accepted" ? (
+                            <button className="btn-ghost" onClick={() => openReturn(o)} style={{ padding:"5px 12px", fontSize:12 }}>
+                              Trả hàng
+                            </button>
                           ) : (
                             <span style={{ color:"var(--muted-2)", fontSize:12 }}>—</span>
                           )}
                         </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </GlassCard>
+            )}
+          </div>
+        )}
+
+        {tab === "returns" && (
+          <div className="fade-up">
+            {loadingReturns ? (
+              <GlassCard style={{ padding:0, overflow:"hidden" }}>
+                <table style={{ width:"100%", borderCollapse:"collapse" }}><tbody>{[1,2,3].map(i => <SkeletonRow key={i} />)}</tbody></table>
+              </GlassCard>
+            ) : returns.length === 0 ? (
+              <GlassCard style={{ padding:0 }}>
+                <EmptyState
+                  icon="↩"
+                  title="Chưa có yêu cầu trả hàng"
+                  sub="Bạn có thể gửi yêu cầu trả hàng từ đơn đã được duyệt trong tab Đơn hàng."
+                  action={() => setTab("orders")}
+                  actionLabel="Xem đơn hàng →"
+                />
+              </GlassCard>
+            ) : (
+              <GlassCard style={{ padding:0, overflow:"hidden" }}>
+                <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+                  <TableHeader cols={["Mã yêu cầu","Đơn gốc","Sản phẩm","SL","Lý do","Hoàn tiền","Trạng thái"]} />
+                  <tbody>
+                    {returns.map(r => (
+                      <tr key={r.ReturnID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
+                        <td style={{ padding:"12px 16px" }}><IdBadge id={r.ReturnID} /></td>
+                        <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{r.OriginalOrderID}</td>
+                        <td style={{ padding:"12px 16px", fontWeight:600 }}>{r.ProductName}</td>
+                        <td style={{ padding:"12px 16px", textAlign:"right" }}>{r.Quantity} {r.Unit || ""}</td>
+                        <td style={{ padding:"12px 16px", color:"var(--muted)", maxWidth:200, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={r.Reason}>{r.Reason}</td>
+                        <td style={{ padding:"12px 16px", textAlign:"right", fontWeight:600 }}>{r.Status === "Approved" ? fmtVnd(r.RefundAmount) : "—"}</td>
+                        <td style={{ padding:"12px 16px" }}><StatusBadge status={r.Status} /></td>
                       </tr>
                     ))}
                   </tbody>
@@ -1126,6 +1233,28 @@ const CustomerPortal = ({ onBack }) => {
           </div>
         )}
       </div>
+
+      {returnTarget && (
+        <Modal title={`Yêu cầu trả hàng · ${returnTarget.OrderID}`} onClose={()=>setReturnTarget(null)}>
+          <div style={{ display:"grid", gap:14 }}>
+            <div style={{ background:"#F8FAFC", border:"1px solid #E2E8F0", borderRadius:10, padding:"10px 14px", fontSize:13, color:"#475569" }}>
+              {returnTarget.productName} · Đã mua {returnTarget.Quantity} sản phẩm
+            </div>
+            <div><Label>SỐ LƯỢNG TRẢ</Label>
+              <GlassInput type="number" min={1} max={returnTarget.Quantity} value={returnForm.Quantity} onChange={e=>setReturnForm({...returnForm,Quantity:e.target.value})} />
+            </div>
+            <div><Label>LÝ DO TRẢ HÀNG</Label>
+              <GlassInput value={returnForm.Reason} onChange={e=>setReturnForm({...returnForm,Reason:e.target.value})} placeholder="VD: Sản phẩm bị lỗi, giao sai mẫu..." />
+            </div>
+            <div style={{ display:"flex", gap:10, marginTop:4 }}>
+              <button className="btn-primary" onClick={submitReturn} disabled={submittingReturn}>
+                {submittingReturn ? "Đang gửi..." : "Gửi yêu cầu"}
+              </button>
+              <button className="btn-ghost" onClick={()=>setReturnTarget(null)}>Hủy</button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 };
@@ -1284,7 +1413,7 @@ const Suppliers = () => {
   const load = useCallback(() => { setLoading(true); apiFetch('/suppliers').then(d=>{setData(d);setLoading(false);}).catch(e=>{showToast(e.message||'Không tải được nhà cung cấp.','error');setLoading(false);}); },[]);
   useEffect(()=>{load();},[load]);
 
-  const blank = { SupplierID:"", SupplierName:"", ContactNumber:"", Location:"", TaxCode:"", Email:"" };
+  const blank = { SupplierID:"", SupplierName:"", ContactNumber:"", Location:"", TaxCode:"", Email:"", Rating:5, OnTimeRate:100 };
   const save = async () => {
     try {
       if (modal==="add") await apiPost('/suppliers', form);
@@ -1311,7 +1440,7 @@ const Suppliers = () => {
       ) : (
         <GlassCard style={{ padding:0, overflow:"hidden" }}>
           <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
-            <TableHeader cols={["Mã NCC","Tên NCC","SĐT","Địa điểm","MST","Thao tác"]} />
+            <TableHeader cols={["Mã NCC","Tên NCC","SĐT","Địa điểm","Đánh giá","Đúng hạn","Thao tác"]} />
             <tbody>
               {filtered.map(s => (
                 <tr key={s.SupplierID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
@@ -1319,7 +1448,8 @@ const Suppliers = () => {
                   <td style={{ padding:"12px 16px", fontWeight:600 }}>{s.SupplierName}</td>
                   <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{s.ContactNumber}</td>
                   <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{s.Location}</td>
-                  <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{s.TaxCode || "—"}</td>
+                  <td style={{ padding:"12px 16px" }}><StarRating value={s.Rating} /> <span style={{ fontSize:11, color:"var(--muted)", marginLeft:4 }}>{s.Rating || 0}/5</span></td>
+                  <td style={{ padding:"12px 16px", fontWeight:600, color: Number(s.OnTimeRate) >= 90 ? "#166534" : Number(s.OnTimeRate) >= 70 ? "#92400E" : "#991B1B" }}>{Number(s.OnTimeRate ?? 100).toFixed(0)}%</td>
                   <td style={{ padding:"12px 16px" }}>
                     <div style={{ display:"flex", gap:8 }}>
                       <button className="btn-ghost" onClick={()=>{setForm({...s});setModal("edit");}} style={{ padding:"5px 12px", fontSize:12 }}>Sửa</button>
@@ -1342,6 +1472,12 @@ const Suppliers = () => {
             <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
               <div><Label>MÃ SỐ THUẾ</Label><GlassInput value={form.TaxCode||""} onChange={e=>setForm({...form,TaxCode:e.target.value})} placeholder="VD: 0101234567" /></div>
               <div><Label>EMAIL</Label><GlassInput type="email" value={form.Email||""} onChange={e=>setForm({...form,Email:e.target.value})} placeholder="contact@company.vn" /></div>
+              <div><Label>ĐÁNH GIÁ (1–5 SAO)</Label>
+                <GlassSelect value={form.Rating ?? 5} onChange={e=>setForm({...form,Rating:+e.target.value})} style={{width:"100%"}}>
+                  {[5,4,3,2,1].map(n=><option key={n} value={n}>{"★".repeat(n)}{"☆".repeat(5-n)} ({n}/5)</option>)}
+                </GlassSelect>
+              </div>
+              <div><Label>TỶ LỆ ĐÚNG HẠN (%)</Label><GlassInput type="number" min={0} max={100} step={0.1} value={form.OnTimeRate ?? 100} onChange={e=>setForm({...form,OnTimeRate:+e.target.value})} /></div>
             </div>
             <div style={{ display:"flex", gap:10, marginTop:4 }}>
               <button className="btn-primary" onClick={save}>Lưu</button>
@@ -1577,6 +1713,8 @@ const Inventory = () => {
   const [form, setForm]         = useState({});
   const [search, setSearch]     = useState("");
   const [delTarget, setDelTarget] = useState(null);
+  const [adjustTarget, setAdjustTarget] = useState(null);
+  const [adjustForm, setAdjustForm] = useState({ NewQuantity: "0", Reason: "Kiểm kê" });
 
   const load = useCallback(() => {
     setLoading(true);
@@ -1595,6 +1733,31 @@ const Inventory = () => {
       setModal(null); load();
     } catch (e) { showToast(e.message || 'Lưu tồn kho thất bại.', 'error'); }
   };
+
+  const saveAdjustment = async () => {
+    const newQuantity = parseInt(adjustForm.NewQuantity, 10);
+    if (Number.isNaN(newQuantity) || newQuantity < 0) {
+      showToast('Số lượng mới phải là số nguyên không âm.', 'error');
+      return;
+    }
+    if (!adjustForm.Reason) {
+      showToast('Vui lòng chọn lý do điều chỉnh.', 'error');
+      return;
+    }
+    try {
+      const res = await apiPost('/inventory/adjust', {
+        InventoryID: adjustTarget.InventoryID,
+        NewQuantity: newQuantity,
+        Reason: adjustForm.Reason,
+      });
+      showToast(`Đã điều chỉnh ${adjustTarget.InventoryID}: ${res.OldQuantity} → ${res.NewQuantity}.`);
+      setAdjustTarget(null);
+      load();
+    } catch (e) {
+      showToast(e.message || 'Điều chỉnh tồn kho thất bại.', 'error');
+    }
+  };
+
   const filtered = data.filter(i => {
     const p = products.find(x=>x.ProductID===i.ProductID);
     return p?.ProductName.toLowerCase().includes(search.toLowerCase()) || i.InventoryID.includes(search);
@@ -1628,6 +1791,13 @@ const Inventory = () => {
                     <td style={{ padding:"12px 16px", fontWeight:700, color:c }}>{i.QuantityAvailable}</td>
                     <td style={{ padding:"12px 16px" }}>
                       <div style={{ display:"flex", gap:8 }}>
+                        <button
+                          className="btn-ghost"
+                          onClick={()=>{
+                            setAdjustTarget({ ...i, productName: prod?.ProductName || i.ProductID, warehouseName: wh?.WarehouseName || i.WarehouseID });
+                            setAdjustForm({ NewQuantity: String(i.QuantityAvailable ?? 0), Reason: "Kiểm kê" });
+                          }}
+                          style={{ padding:"5px 12px", fontSize:12 }}>Điều chỉnh</button>
                         <button className="btn-ghost" onClick={()=>{setForm({...i});setModal("edit");}} style={{ padding:"5px 12px", fontSize:12 }}>Sửa</button>
                         <button className="btn-danger" onClick={()=>setDelTarget({id:i.InventoryID,name:prod?.ProductName||i.InventoryID})} style={{ padding:"5px 12px", fontSize:12 }}>Xóa</button>
                       </div>
@@ -1657,6 +1827,36 @@ const Inventory = () => {
             <div style={{ display:"flex", gap:10, marginTop:4 }}>
               <button className="btn-primary" onClick={save}>Lưu</button>
               <button className="btn-ghost" onClick={()=>setModal(null)}>Hủy</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+      {adjustTarget && (
+        <Modal title="Điều chỉnh tồn kho" onClose={()=>setAdjustTarget(null)}>
+          <div style={{ display:"grid", gap:14 }}>
+            <div style={{ background:"#F8FAFC", border:"1px solid #E2E8F0", borderRadius:10, padding:"10px 14px", fontSize:13, color:"#475569" }}>
+              <div>{adjustTarget.productName} · {adjustTarget.warehouseName}</div>
+              <div style={{ marginTop:4 }}>Tồn hiện tại: <strong>{adjustTarget.QuantityAvailable}</strong> · Mã: {adjustTarget.InventoryID}</div>
+            </div>
+            <div>
+              <Label>SỐ LƯỢNG MỚI</Label>
+              <GlassInput
+                type="number"
+                min="0"
+                step="1"
+                value={adjustForm.NewQuantity}
+                onChange={e=>setAdjustForm({...adjustForm, NewQuantity:e.target.value})}
+              />
+            </div>
+            <div>
+              <Label>LÝ DO ĐIỀU CHỈNH</Label>
+              <GlassSelect value={adjustForm.Reason} onChange={e=>setAdjustForm({...adjustForm, Reason:e.target.value})} style={{ width:"100%" }}>
+                {["Kiểm kê","Hàng hỏng","Nhập thêm","Xuất kho"].map(r=><option key={r} value={r}>{r}</option>)}
+              </GlassSelect>
+            </div>
+            <div style={{ display:"flex", gap:10, marginTop:4 }}>
+              <button className="btn-primary" onClick={saveAdjustment}>Xác nhận</button>
+              <button className="btn-ghost" onClick={()=>setAdjustTarget(null)}>Hủy</button>
             </div>
           </div>
         </Modal>
@@ -1783,6 +1983,8 @@ const Orders = ({ refreshPending }) => {
   const [form, setForm]         = useState({});
   const [search, setSearch]     = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo]     = useState("");
   const [invoiceOrder, setInvoiceOrder] = useState(null);
   const [delTarget, setDelTarget] = useState(null);
 
@@ -1821,15 +2023,57 @@ const Orders = ({ refreshPending }) => {
     const c = customers.find(x=>x.CustomerID===o.CustomerID);
     const matchSearch = c?.CustomerName.toLowerCase().includes(search.toLowerCase()) || o.OrderID.includes(search);
     const matchStatus = statusFilter === "All" || (o.Status||"Accepted") === statusFilter;
-    return matchSearch && matchStatus;
+    const matchFrom = !dateFrom || o.OrderDate >= dateFrom;
+    const matchTo = !dateTo || o.OrderDate <= dateTo;
+    return matchSearch && matchStatus && matchFrom && matchTo;
   });
 
   const pendingCount = data.filter(o => o.Status === "Pending").length;
+  const hasDateFilter = Boolean(dateFrom || dateTo);
+
+  const csvRows = filtered.map(o => {
+    const cust = customers.find(c => c.CustomerID === o.CustomerID);
+    const prod = products.find(p => p.ProductID === o.ProductID);
+    return {
+      OrderID: o.OrderID,
+      OrderDate: o.OrderDate,
+      Customer: cust?.CustomerName || o.CustomerID,
+      Product: `${prod?.ProductName || o.ProductID || ""}${o.Quantity > 1 ? ` × ${o.Quantity}` : ""}`,
+      Amount: Number(o.Bill) || 0,
+      Status: STATUS_VI[o.Status] || o.Status || "",
+    };
+  });
+  const csvHeaders = [
+    { label: "Mã đơn", key: "OrderID" },
+    { label: "Ngày", key: "OrderDate" },
+    { label: "Khách hàng", key: "Customer" },
+    { label: "Sản phẩm", key: "Product" },
+    { label: "Số tiền", key: "Amount" },
+    { label: "Trạng thái", key: "Status" },
+  ];
+  const exportBtn = filtered.length > 0 ? (
+    <CSVLink
+      data={csvRows}
+      headers={csvHeaders}
+      filename={`don-hang-${new Date().toISOString().slice(0,10)}.csv`}
+      bom
+      className="btn-teal"
+      style={{ textDecoration:"none", display:"inline-flex", alignItems:"center", gap:6 }}
+    >
+      Xuất Excel
+    </CSVLink>
+  ) : (
+    <button className="btn-teal" disabled style={{ opacity:0.5, cursor:"not-allowed" }}>Xuất Excel</button>
+  );
 
   return (
     <div className="fade-up">
-      {/* ✅ FIXED: Removed addBtn and action prop — orders come from Customer Portal only */}
-      <PageHeader crumb="ĐƠN HÀNG" title="Đơn hàng" sub={`${data.length} tổng đơn hàng${pendingCount > 0 ? ` · ${pendingCount} chờ duyệt` : ''}`} />
+      <PageHeader
+        crumb="ĐƠN HÀNG"
+        title="Đơn hàng"
+        sub={`${data.length} tổng đơn hàng${pendingCount > 0 ? ` · ${pendingCount} chờ duyệt` : ''}`}
+        action={exportBtn}
+      />
 
       <div style={{ display:"flex", gap:8, marginBottom:16 }}>
         {["All","Accepted","Pending","Rejected","Cancelled"].map(f => (
@@ -1843,7 +2087,25 @@ const Orders = ({ refreshPending }) => {
       </div>
 
       <GlassCard style={{ marginBottom:16, padding:16 }}>
-        <GlassInput placeholder="🔍  Tìm theo khách hàng hoặc mã đơn..." value={search} onChange={e=>setSearch(e.target.value)} />
+        <div style={{ display:"flex", gap:12, alignItems:"flex-end", flexWrap:"wrap" }}>
+          <div style={{ flex:"1 1 260px" }}>
+            <Label>TÌM KIẾM</Label>
+            <GlassInput placeholder="🔍  Tìm theo khách hàng hoặc mã đơn..." value={search} onChange={e=>setSearch(e.target.value)} />
+          </div>
+          <div style={{ width:170 }}>
+            <Label>TỪ NGÀY</Label>
+            <GlassInput type="date" value={dateFrom} max={dateTo || undefined} onChange={e=>setDateFrom(e.target.value)} />
+          </div>
+          <div style={{ width:170 }}>
+            <Label>ĐẾN NGÀY</Label>
+            <GlassInput type="date" value={dateTo} min={dateFrom || undefined} onChange={e=>setDateTo(e.target.value)} />
+          </div>
+          {hasDateFilter && (
+            <button className="btn-ghost" onClick={()=>{setDateFrom("");setDateTo("");}} style={{ padding:"10px 16px", fontSize:13 }}>
+              Xóa lọc
+            </button>
+          )}
+        </div>
       </GlassCard>
 
       {loading ? (
@@ -1853,8 +2115,8 @@ const Orders = ({ refreshPending }) => {
         <GlassCard style={{ padding:0 }}>
           <EmptyState
             icon="🛒"
-            title={search ? 'Không có đơn hàng nào khớp' : 'Chưa có đơn hàng'}
-            sub={search ? 'Thử từ khóa khác.' : 'Đơn hàng do khách hàng đặt qua Cổng khách hàng sẽ xuất hiện ở đây.'}
+            title={(search || hasDateFilter) ? 'Không có đơn hàng nào khớp' : 'Chưa có đơn hàng'}
+            sub={(search || hasDateFilter) ? 'Thử từ khóa hoặc khoảng ngày khác.' : 'Đơn hàng do khách hàng đặt qua Cổng khách hàng sẽ xuất hiện ở đây.'}
           />
         </GlassCard>
       ) : (
@@ -1973,6 +2235,565 @@ const Orders = ({ refreshPending }) => {
   );
 };
 
+// ══ PURCHASE ORDERS (V2) ══════════════════════════════════════════════════════
+const PurchaseOrders = () => {
+  const [data, setData] = useState([]);
+  const [products, setProducts] = useState([]);
+  const [suppliers, setSuppliers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [modal, setModal] = useState(false);
+  const [form, setForm] = useState({});
+  const [receiveTarget, setReceiveTarget] = useState(null);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    Promise.all([apiFetch('/purchase-orders'), apiFetch('/products'), apiFetch('/suppliers')])
+      .then(([po, p, s]) => { setData(po); setProducts(p); setSuppliers(s); setLoading(false); })
+      .catch(e => { showToast(e.message || 'Không tải được đơn mua hàng.', 'error'); setLoading(false); });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const openAdd = () => {
+    const firstProduct = products[0];
+    setForm({
+      SupplierID: suppliers[0]?.SupplierID || '',
+      ProductID: firstProduct?.ProductID || '',
+      Quantity: 1,
+      UnitPrice: Number(firstProduct?.UnitPrice) || 0,
+      OrderDate: new Date().toISOString().slice(0, 10),
+    });
+    setModal(true);
+  };
+
+  const save = async () => {
+    if (!form.SupplierID || !form.ProductID) { showToast('Chọn nhà cung cấp và sản phẩm.', 'error'); return; }
+    const quantity = parseInt(form.Quantity, 10);
+    const unitPrice = Number(form.UnitPrice);
+    if (!quantity || quantity < 1) { showToast('Số lượng phải lớn hơn 0.', 'error'); return; }
+    if (Number.isNaN(unitPrice) || unitPrice < 0) { showToast('Đơn giá không hợp lệ.', 'error'); return; }
+    try {
+      await apiPost('/purchase-orders', { ...form, Quantity: quantity, UnitPrice: unitPrice });
+      showToast('Đã tạo đơn mua hàng.');
+      setModal(false); load();
+    } catch (e) { showToast(e.message || 'Tạo đơn mua hàng thất bại.', 'error'); }
+  };
+
+  const receive = async () => {
+    try {
+      const res = await apiPatch(`/purchase-orders/${receiveTarget.POID}/receive`);
+      showToast(`Đã nhập kho ${receiveTarget.POID}: ${res.OldQuantity} → ${res.NewQuantity}.`);
+      setReceiveTarget(null); load();
+    } catch (e) { showToast(e.message || 'Nhập kho thất bại.', 'error'); }
+  };
+
+  const orderedCount = data.filter(po => po.Status === 'Ordered').length;
+  const receivedValue = data.filter(po => po.Status === 'Received').reduce((a, po) => a + Number(po.TotalAmount || 0), 0);
+  const addBtn = <button className="btn-primary" onClick={openAdd}>+ Tạo đơn mua</button>;
+
+  return (
+    <div className="fade-up">
+      <PageHeader
+        crumb="NHẬP HÀNG"
+        title="Đơn mua hàng"
+        sub={`${data.length} đơn mua · ${orderedCount} chờ nhập kho · Đã nhập: ${fmtVnd(receivedValue)}`}
+        action={addBtn}
+      />
+      {loading ? (
+        <GlassCard style={{ padding:0, overflow:'hidden' }}><table style={{ width:'100%', borderCollapse:'collapse' }}><tbody>{[1,2,3].map(i=><SkeletonRow key={i}/>)}</tbody></table></GlassCard>
+      ) : data.length === 0 ? (
+        <GlassCard style={{ padding:0 }}>
+          <EmptyState icon="📥" title="Chưa có đơn mua hàng" sub="Tạo đơn mua để nhập thêm hàng vào kho." action={openAdd} actionLabel="+ Tạo đơn mua" />
+        </GlassCard>
+      ) : (
+        <GlassCard style={{ padding:0, overflow:"hidden" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+            <TableHeader cols={["Mã đơn","Nhà cung cấp","Sản phẩm","SL","Đơn giá","Tổng tiền","Ngày đặt","Trạng thái","Thao tác"]} />
+            <tbody>
+              {data.map(po => (
+                <tr key={po.POID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
+                  <td style={{ padding:"12px 16px" }}><IdBadge id={po.POID} />{po.PRID && <div style={{ fontSize:10, color:"var(--muted)", marginTop:3 }}>từ {po.PRID}</div>}</td>
+                  <td style={{ padding:"12px 16px", fontWeight:600 }}>{po.SupplierName}</td>
+                  <td style={{ padding:"12px 16px" }}>{po.ProductName}</td>
+                  <td style={{ padding:"12px 16px", textAlign:"right" }}>{po.Quantity} {po.Unit || ""}</td>
+                  <td style={{ padding:"12px 16px", textAlign:"right" }}>{fmtVnd(po.UnitPrice)}</td>
+                  <td style={{ padding:"12px 16px", textAlign:"right", fontWeight:700, color:"#1F2937" }}>{fmtVnd(po.TotalAmount)}</td>
+                  <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{po.OrderDate}</td>
+                  <td style={{ padding:"12px 16px" }}><StatusBadge status={po.Status} /></td>
+                  <td style={{ padding:"12px 16px" }}>
+                    {po.Status === "Ordered" ? (
+                      <button className="btn-primary" onClick={()=>setReceiveTarget(po)} style={{ padding:"5px 12px", fontSize:12 }}>Nhận hàng</button>
+                    ) : (
+                      <span style={{ color:"var(--muted-2)", fontSize:12 }}>—</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </GlassCard>
+      )}
+
+      {modal && (
+        <Modal title="Tạo đơn mua hàng" onClose={()=>setModal(false)}>
+          <div style={{ display:"grid", gap:14 }}>
+            <div><Label>NHÀ CUNG CẤP</Label>
+              <GlassSelect value={form.SupplierID} onChange={e=>setForm({...form,SupplierID:e.target.value})} style={{width:"100%"}}>
+                {suppliers.map(s=><option key={s.SupplierID} value={s.SupplierID}>{s.SupplierName}</option>)}
+              </GlassSelect>
+            </div>
+            <div><Label>SẢN PHẨM</Label>
+              <GlassSelect value={form.ProductID} onChange={e=>{
+                const prod = products.find(p=>p.ProductID===e.target.value);
+                setForm({...form, ProductID:e.target.value, UnitPrice:Number(prod?.UnitPrice)||0});
+              }} style={{width:"100%"}}>
+                {products.map(p=><option key={p.ProductID} value={p.ProductID}>{p.ProductName}</option>)}
+              </GlassSelect>
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+              <div><Label>SỐ LƯỢNG</Label><GlassInput type="number" min={1} value={form.Quantity||1} onChange={e=>setForm({...form,Quantity:e.target.value})} /></div>
+              <div><Label>ĐƠN GIÁ (VNĐ)</Label><GlassInput type="number" min={0} value={form.UnitPrice||0} onChange={e=>setForm({...form,UnitPrice:e.target.value})} /></div>
+            </div>
+            <div><Label>NGÀY ĐẶT</Label><GlassInput type="date" value={form.OrderDate||""} onChange={e=>setForm({...form,OrderDate:e.target.value})} /></div>
+            <div style={{ background:"#F8FAFC", border:"1px solid #E2E8F0", borderRadius:10, padding:"10px 14px", fontSize:13, color:"#475569" }}>
+              Tổng tiền: <strong style={{ color:"#1F2937" }}>{fmtVnd((parseInt(form.Quantity,10)||0) * (Number(form.UnitPrice)||0))}</strong>
+            </div>
+            <div style={{ display:"flex", gap:10, marginTop:4 }}>
+              <button className="btn-primary" onClick={save}>Lưu đơn mua</button>
+              <button className="btn-ghost" onClick={()=>setModal(false)}>Hủy</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {receiveTarget && (
+        <Modal title="Xác nhận nhập kho" onClose={()=>setReceiveTarget(null)}>
+          <div style={{ marginBottom:20 }}>
+            <div style={{ color:'var(--muted)', fontSize:13, marginBottom:8 }}>Hàng sẽ được cộng vào tồn kho:</div>
+            <div style={{ background:'#F0FDF4', border:'1px solid #BBF7D0', borderRadius:10, padding:'10px 14px', fontSize:14 }}>
+              <div style={{ fontWeight:600 }}>{receiveTarget.POID} · {receiveTarget.ProductName}</div>
+              <div style={{ color:"#475569", marginTop:4 }}>{receiveTarget.SupplierName} · {receiveTarget.Quantity} {receiveTarget.Unit || ""} · {fmtVnd(receiveTarget.TotalAmount)}</div>
+            </div>
+          </div>
+          <div style={{ display:'flex', gap:10 }}>
+            <button className="btn-primary" onClick={receive}>Nhập kho</button>
+            <button className="btn-ghost" onClick={()=>setReceiveTarget(null)}>Hủy</button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+};
+
+// ══ PURCHASE REQUISITIONS (V3) ════════════════════════════════════════════════
+const PurchaseRequisitions = () => {
+  const [data, setData] = useState([]);
+  const [products, setProducts] = useState([]);
+  const [suppliers, setSuppliers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [modal, setModal] = useState(false);
+  const [form, setForm] = useState({ ProductID:"", Quantity:1 });
+  const [poTarget, setPoTarget] = useState(null);
+  const [poForm, setPoForm] = useState({ SupplierID:"", UnitPrice:0, OrderDate:"" });
+
+  const load = useCallback(() => {
+    setLoading(true);
+    Promise.all([apiFetch('/purchase-requisitions'), apiFetch('/products'), apiFetch('/suppliers')])
+      .then(([pr, p, s]) => { setData(pr); setProducts(p); setSuppliers(s); setLoading(false); })
+      .catch(e => { showToast(e.message || 'Không tải được yêu cầu mua hàng.', 'error'); setLoading(false); });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const openAdd = () => { setForm({ ProductID: products[0]?.ProductID || "", Quantity: 1 }); setModal(true); };
+
+  const save = async () => {
+    const quantity = parseInt(form.Quantity, 10);
+    if (!form.ProductID || !quantity || quantity < 1) { showToast('Chọn sản phẩm và số lượng hợp lệ.', 'error'); return; }
+    try {
+      const res = await apiPost('/purchase-requisitions', { ProductID: form.ProductID, Quantity: quantity });
+      showToast(`Đã tạo yêu cầu ${res.PRID}.`);
+      setModal(false); load();
+    } catch (e) { showToast(e.message || 'Tạo yêu cầu mua hàng thất bại.', 'error'); }
+  };
+
+  const decide = async (pr, status) => {
+    try {
+      await apiPatch(`/purchase-requisitions/${pr.PRID}/status`, { Status: status });
+      showToast(`${status === "Approved" ? "Đã duyệt" : "Đã từ chối"} yêu cầu ${pr.PRID}.`);
+      load();
+    } catch (e) { showToast(e.message || 'Cập nhật trạng thái thất bại.', 'error'); }
+  };
+
+  const openCreatePO = (pr) => {
+    setPoTarget(pr);
+    setPoForm({
+      SupplierID: suppliers[0]?.SupplierID || "",
+      UnitPrice: Number(pr.UnitPrice) || 0,
+      OrderDate: new Date().toISOString().slice(0, 10),
+    });
+  };
+
+  const createPO = async () => {
+    if (!poForm.SupplierID) { showToast('Chọn nhà cung cấp.', 'error'); return; }
+    const unitPrice = Number(poForm.UnitPrice);
+    if (Number.isNaN(unitPrice) || unitPrice < 0) { showToast('Đơn giá không hợp lệ.', 'error'); return; }
+    try {
+      const res = await apiPost('/purchase-orders', {
+        PRID: poTarget.PRID,
+        SupplierID: poForm.SupplierID,
+        UnitPrice: unitPrice,
+        OrderDate: poForm.OrderDate,
+      });
+      showToast(`Đã tạo đơn mua ${res.POID} từ ${poTarget.PRID}.`);
+      setPoTarget(null); load();
+    } catch (e) { showToast(e.message || 'Tạo đơn mua thất bại.', 'error'); }
+  };
+
+  const pendingCount = data.filter(pr => pr.Status === "Pending_Approval").length;
+  const addBtn = <button className="btn-primary" onClick={openAdd}>+ Yêu cầu mua</button>;
+
+  return (
+    <div className="fade-up">
+      <PageHeader
+        crumb="MUA HÀNG"
+        title="Yêu cầu mua hàng"
+        sub={`${data.length} yêu cầu${pendingCount > 0 ? ` · ${pendingCount} chờ duyệt` : ""}`}
+        action={addBtn}
+      />
+      {loading ? (
+        <GlassCard style={{ padding:0, overflow:'hidden' }}><table style={{ width:'100%', borderCollapse:'collapse' }}><tbody>{[1,2,3].map(i=><SkeletonRow key={i}/>)}</tbody></table></GlassCard>
+      ) : data.length === 0 ? (
+        <GlassCard style={{ padding:0 }}>
+          <EmptyState icon="🧾" title="Chưa có yêu cầu mua hàng" sub="Tạo yêu cầu, duyệt và chuyển thành đơn mua." action={openAdd} actionLabel="+ Yêu cầu mua" />
+        </GlassCard>
+      ) : (
+        <GlassCard style={{ padding:0, overflow:"hidden" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+            <TableHeader cols={["Mã yêu cầu","Sản phẩm","SL","Người yêu cầu","Ngày tạo","Trạng thái","Thao tác"]} />
+            <tbody>
+              {data.map(pr => (
+                <tr key={pr.PRID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
+                  <td style={{ padding:"12px 16px" }}><IdBadge id={pr.PRID} /></td>
+                  <td style={{ padding:"12px 16px", fontWeight:600 }}>{pr.ProductName}</td>
+                  <td style={{ padding:"12px 16px", textAlign:"right" }}>{pr.Quantity} {pr.Unit || ""}</td>
+                  <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{pr.RequestedBy}</td>
+                  <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{String(pr.CreatedAt).slice(0, 10)}</td>
+                  <td style={{ padding:"12px 16px" }}><StatusBadge status={pr.Status} /></td>
+                  <td style={{ padding:"12px 16px" }}>
+                    {pr.Status === "Pending_Approval" ? (
+                      <div style={{ display:"flex", gap:8 }}>
+                        <button className="btn-primary" onClick={()=>decide(pr, "Approved")} style={{ padding:"5px 12px", fontSize:12 }}>Duyệt</button>
+                        <button className="btn-danger" onClick={()=>decide(pr, "Rejected")} style={{ padding:"5px 12px", fontSize:12 }}>Từ chối</button>
+                      </div>
+                    ) : pr.Status === "Approved" ? (
+                      <button className="btn-teal" onClick={()=>openCreatePO(pr)} style={{ padding:"5px 12px", fontSize:12 }}>Tạo đơn mua</button>
+                    ) : (
+                      <span style={{ color:"var(--muted-2)", fontSize:12 }}>—</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </GlassCard>
+      )}
+
+      {modal && (
+        <Modal title="Tạo yêu cầu mua hàng" onClose={()=>setModal(false)}>
+          <div style={{ display:"grid", gap:14 }}>
+            <div><Label>SẢN PHẨM</Label>
+              <GlassSelect value={form.ProductID} onChange={e=>setForm({...form,ProductID:e.target.value})} style={{width:"100%"}}>
+                {products.map(p=><option key={p.ProductID} value={p.ProductID}>{p.ProductName}</option>)}
+              </GlassSelect>
+            </div>
+            <div><Label>SỐ LƯỢNG</Label><GlassInput type="number" min={1} value={form.Quantity||1} onChange={e=>setForm({...form,Quantity:e.target.value})} /></div>
+            <div style={{ display:"flex", gap:10, marginTop:4 }}>
+              <button className="btn-primary" onClick={save}>Gửi yêu cầu</button>
+              <button className="btn-ghost" onClick={()=>setModal(false)}>Hủy</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {poTarget && (
+        <Modal title={`Tạo đơn mua từ ${poTarget.PRID}`} onClose={()=>setPoTarget(null)}>
+          <div style={{ display:"grid", gap:14 }}>
+            <div style={{ background:"#F8FAFC", border:"1px solid #E2E8F0", borderRadius:10, padding:"10px 14px", fontSize:13, color:"#475569" }}>
+              {poTarget.ProductName} · {poTarget.Quantity} {poTarget.Unit || ""}
+            </div>
+            <div><Label>NHÀ CUNG CẤP</Label>
+              <GlassSelect value={poForm.SupplierID} onChange={e=>setPoForm({...poForm,SupplierID:e.target.value})} style={{width:"100%"}}>
+                {suppliers.map(s=><option key={s.SupplierID} value={s.SupplierID}>{s.SupplierName}</option>)}
+              </GlassSelect>
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+              <div><Label>ĐƠN GIÁ (VNĐ)</Label><GlassInput type="number" min={0} value={poForm.UnitPrice||0} onChange={e=>setPoForm({...poForm,UnitPrice:e.target.value})} /></div>
+              <div><Label>NGÀY ĐẶT</Label><GlassInput type="date" value={poForm.OrderDate||""} onChange={e=>setPoForm({...poForm,OrderDate:e.target.value})} /></div>
+            </div>
+            <div style={{ display:"flex", gap:10, marginTop:4 }}>
+              <button className="btn-primary" onClick={createPO}>Tạo đơn mua</button>
+              <button className="btn-ghost" onClick={()=>setPoTarget(null)}>Hủy</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+};
+
+// ══ RETURNS (V3) ══════════════════════════════════════════════════════════════
+const Returns = () => {
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    apiFetch('/returns')
+      .then(d => { setData(d); setLoading(false); })
+      .catch(e => { showToast(e.message || 'Không tải được yêu cầu trả hàng.', 'error'); setLoading(false); });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const decide = async (r, status) => {
+    if (status === "Approved" && !window.confirm(`Duyệt trả hàng ${r.ReturnID}? Hàng sẽ được cộng lại vào tồn kho.`)) return;
+    try {
+      const res = await apiPatch(`/returns/${r.ReturnID}/status`, { Status: status });
+      showToast(status === "Approved" ? `Đã duyệt ${r.ReturnID} · Hoàn tiền ${fmtVnd(res.RefundAmount)}.` : `Đã từ chối ${r.ReturnID}.`);
+      load();
+    } catch (e) { showToast(e.message || 'Xử lý yêu cầu trả hàng thất bại.', 'error'); }
+  };
+
+  const pendingCount = data.filter(r => r.Status === "Pending").length;
+
+  return (
+    <div className="fade-up">
+      <PageHeader
+        crumb="TRẢ HÀNG"
+        title="Yêu cầu trả hàng"
+        sub={`${data.length} yêu cầu${pendingCount > 0 ? ` · ${pendingCount} chờ xử lý` : ""}`}
+      />
+      {loading ? (
+        <GlassCard style={{ padding:0, overflow:'hidden' }}><table style={{ width:'100%', borderCollapse:'collapse' }}><tbody>{[1,2,3].map(i=><SkeletonRow key={i}/>)}</tbody></table></GlassCard>
+      ) : data.length === 0 ? (
+        <GlassCard style={{ padding:0 }}>
+          <EmptyState icon="↩" title="Chưa có yêu cầu trả hàng" sub="Khách hàng có thể gửi yêu cầu trả hàng từ Cổng khách hàng." />
+        </GlassCard>
+      ) : (
+        <GlassCard style={{ padding:0, overflow:"hidden" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+            <TableHeader cols={["Mã trả","Đơn gốc","Khách hàng","Sản phẩm","SL","Lý do","Hoàn tiền","Trạng thái","Thao tác"]} />
+            <tbody>
+              {data.map(r => (
+                <tr key={r.ReturnID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
+                  <td style={{ padding:"12px 16px" }}><IdBadge id={r.ReturnID} /></td>
+                  <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{r.OriginalOrderID}</td>
+                  <td style={{ padding:"12px 16px", fontWeight:600 }}>{r.CustomerName || r.CustomerID}</td>
+                  <td style={{ padding:"12px 16px" }}>{r.ProductName}</td>
+                  <td style={{ padding:"12px 16px", textAlign:"right" }}>{r.Quantity} {r.Unit || ""}</td>
+                  <td style={{ padding:"12px 16px", color:"var(--muted)", maxWidth:180, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={r.Reason}>{r.Reason}</td>
+                  <td style={{ padding:"12px 16px", textAlign:"right", fontWeight:600 }}>{r.Status === "Approved" ? fmtVnd(r.RefundAmount) : "—"}</td>
+                  <td style={{ padding:"12px 16px" }}><StatusBadge status={r.Status} /></td>
+                  <td style={{ padding:"12px 16px" }}>
+                    {r.Status === "Pending" ? (
+                      <div style={{ display:"flex", gap:8 }}>
+                        <button className="btn-primary" onClick={()=>decide(r, "Approved")} style={{ padding:"5px 12px", fontSize:12 }}>Duyệt</button>
+                        <button className="btn-danger" onClick={()=>decide(r, "Rejected")} style={{ padding:"5px 12px", fontSize:12 }}>Từ chối</button>
+                      </div>
+                    ) : (
+                      <span style={{ color:"var(--muted-2)", fontSize:12 }}>—</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </GlassCard>
+      )}
+    </div>
+  );
+};
+
+// ══ STOCKTAKE (V3) ════════════════════════════════════════════════════════════
+const Stocktake = () => {
+  const [data, setData] = useState([]);
+  const [warehouses, setWarehouses] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [warehouseID, setWarehouseID] = useState("");
+  const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    Promise.all([apiFetch('/stocktake-sessions'), apiFetch('/warehouses')])
+      .then(([s, w]) => { setData(s); setWarehouses(w); setLoading(false); })
+      .catch(e => { showToast(e.message || 'Không tải được phiên kiểm kê.', 'error'); setLoading(false); });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const openCreate = () => { setWarehouseID(warehouses[0]?.WarehouseID || ""); setCreateOpen(true); };
+
+  const createSession = async () => {
+    if (!warehouseID) { showToast('Chọn kho cần kiểm kê.', 'error'); return; }
+    try {
+      const res = await apiPost('/stocktake-sessions', { WarehouseID: warehouseID });
+      showToast(`Đã tạo phiên ${res.SessionID} với ${res.ItemCount} sản phẩm.`);
+      setCreateOpen(false); load(); openDetail(res.SessionID);
+    } catch (e) { showToast(e.message || 'Tạo phiên kiểm kê thất bại.', 'error'); }
+  };
+
+  const openDetail = async (sid) => {
+    setDetailLoading(true);
+    try {
+      const s = await apiFetch(`/stocktake-sessions/${sid}`);
+      setDetail(s);
+    } catch (e) { showToast(e.message || 'Không tải được chi tiết kiểm kê.', 'error'); }
+    setDetailLoading(false);
+  };
+
+  const setActual = (productId, value) => {
+    setDetail(d => ({ ...d, items: d.items.map(it => it.ProductID === productId ? { ...it, ActualQuantity: value } : it) }));
+  };
+
+  const saveItems = async () => {
+    const entries = (detail.items || [])
+      .filter(it => it.ActualQuantity !== "" && it.ActualQuantity != null)
+      .map(it => ({ ProductID: it.ProductID, ActualQuantity: parseInt(it.ActualQuantity, 10) }));
+    if (entries.length === 0) { showToast('Nhập ít nhất một số lượng thực tế.', 'error'); return; }
+    if (entries.some(e => Number.isNaN(e.ActualQuantity) || e.ActualQuantity < 0)) {
+      showToast('Số lượng thực tế phải là số nguyên không âm.', 'error'); return;
+    }
+    setSaving(true);
+    try {
+      const res = await apiPatch(`/stocktake-sessions/${detail.SessionID}/items`, { Items: entries });
+      showToast(`Đã lưu ${res.Updated} dòng kiểm kê.`);
+      await openDetail(detail.SessionID);
+      load();
+    } catch (e) { showToast(e.message || 'Lưu kiểm kê thất bại.', 'error'); }
+    setSaving(false);
+  };
+
+  const complete = async () => {
+    if (!window.confirm(`Hoàn tất phiên ${detail.SessionID}? Tồn kho sẽ được cập nhật theo số lượng thực tế.`)) return;
+    setSaving(true);
+    try {
+      const res = await apiPatch(`/stocktake-sessions/${detail.SessionID}/complete`);
+      showToast(`Đã hoàn tất ${detail.SessionID} · ${res.AdjustedCount} sản phẩm được điều chỉnh.`);
+      setDetail(null); load();
+    } catch (e) { showToast(e.message || 'Hoàn tất kiểm kê thất bại.', 'error'); }
+    setSaving(false);
+  };
+
+  const addBtn = <button className="btn-primary" onClick={openCreate}>+ Phiên kiểm kê</button>;
+
+  return (
+    <div className="fade-up">
+      <PageHeader crumb="KIỂM KÊ" title="Phiên kiểm kê" sub={`${data.length} phiên kiểm kê`} action={addBtn} />
+      {loading ? (
+        <GlassCard style={{ padding:0, overflow:'hidden' }}><table style={{ width:'100%', borderCollapse:'collapse' }}><tbody>{[1,2,3].map(i=><SkeletonRow key={i}/>)}</tbody></table></GlassCard>
+      ) : data.length === 0 ? (
+        <GlassCard style={{ padding:0 }}>
+          <EmptyState icon="🧮" title="Chưa có phiên kiểm kê" sub="Tạo phiên kiểm kê để đối chiếu tồn kho thực tế." action={openCreate} actionLabel="+ Phiên kiểm kê" />
+        </GlassCard>
+      ) : (
+        <GlassCard style={{ padding:0, overflow:"hidden" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+            <TableHeader cols={["Mã phiên","Kho","Số sản phẩm","Người tạo","Ngày tạo","Trạng thái","Thao tác"]} />
+            <tbody>
+              {data.map(s => (
+                <tr key={s.SessionID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
+                  <td style={{ padding:"12px 16px" }}><IdBadge id={s.SessionID} /></td>
+                  <td style={{ padding:"12px 16px", fontWeight:600 }}>{s.WarehouseName}</td>
+                  <td style={{ padding:"12px 16px", textAlign:"right" }}>{s.ItemCount}</td>
+                  <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{s.CreatedBy}</td>
+                  <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{String(s.CreatedAt).slice(0, 10)}</td>
+                  <td style={{ padding:"12px 16px" }}><StatusBadge status={s.Status} /></td>
+                  <td style={{ padding:"12px 16px" }}>
+                    <button className="btn-ghost" onClick={()=>openDetail(s.SessionID)} style={{ padding:"5px 12px", fontSize:12 }}>
+                      {s.Status === "Completed" ? "Xem" : "Kiểm kê"}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </GlassCard>
+      )}
+
+      {createOpen && (
+        <Modal title="Tạo phiên kiểm kê" onClose={()=>setCreateOpen(false)}>
+          <div style={{ display:"grid", gap:14 }}>
+            <div><Label>KHO HÀNG</Label>
+              <GlassSelect value={warehouseID} onChange={e=>setWarehouseID(e.target.value)} style={{width:"100%"}}>
+                {warehouses.map(w=><option key={w.WarehouseID} value={w.WarehouseID}>{w.WarehouseName}</option>)}
+              </GlassSelect>
+            </div>
+            <div style={{ fontSize:12, color:"var(--muted)" }}>Hệ thống sẽ tự thêm toàn bộ sản phẩm đang có trong kho vào phiên kiểm kê.</div>
+            <div style={{ display:"flex", gap:10, marginTop:4 }}>
+              <button className="btn-primary" onClick={createSession}>Tạo phiên</button>
+              <button className="btn-ghost" onClick={()=>setCreateOpen(false)}>Hủy</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {detailLoading && !detail && <Spinner />}
+      {detail && (
+        <Modal title={`Kiểm kê ${detail.SessionID} · ${detail.WarehouseName}`} onClose={()=>setDetail(null)} wide>
+          <div style={{ marginBottom:12, display:"flex", gap:10, alignItems:"center" }}>
+            <StatusBadge status={detail.Status} />
+            <span style={{ fontSize:12, color:"var(--muted)" }}>{detail.items.length} sản phẩm</span>
+          </div>
+          <div style={{ maxHeight:"50vh", overflowY:"auto", border:"1px solid #E5E7EB", borderRadius:10 }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+              <thead style={{ position:"sticky", top:0 }}>
+                <tr style={{ background:"#F9FAFB" }}>
+                  {["Sản phẩm","Tồn hệ thống","Thực tế","Chênh lệch"].map(h=><th key={h} style={{ padding:"10px 14px", textAlign:"left", fontSize:11, color:"#6B7280", fontWeight:600, letterSpacing:0.5 }}>{h.toUpperCase()}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {(detail.items || []).map(it => {
+                  const diff = it.ActualQuantity === "" || it.ActualQuantity == null ? null : Number(it.ActualQuantity) - Number(it.SystemQuantity);
+                  const done = detail.Status === "Completed";
+                  return (
+                    <tr key={it.ProductID} style={{ borderTop:"1px solid #F3F4F6" }}>
+                      <td style={{ padding:"10px 14px", fontWeight:600 }}>{it.ProductName}</td>
+                      <td style={{ padding:"10px 14px" }}>{it.SystemQuantity} {it.Unit || ""}</td>
+                      <td style={{ padding:"10px 14px" }}>
+                        {done ? (it.ActualQuantity ?? "—") : (
+                          <input
+                            type="number" min="0" step="1"
+                            value={it.ActualQuantity ?? ""}
+                            onChange={e=>setActual(it.ProductID, e.target.value)}
+                            className="glass-input"
+                            style={{ width:100, padding:"6px 10px", fontSize:13 }}
+                          />
+                        )}
+                      </td>
+                      <td style={{ padding:"10px 14px", fontWeight:600, color: diff == null ? "#6B7280" : diff === 0 ? "#166534" : diff > 0 ? "#1D4ED8" : "#B91C1C" }}>
+                        {diff == null ? "—" : diff > 0 ? `+${diff}` : diff}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ display:"flex", gap:10, marginTop:16 }}>
+            {detail.Status !== "Completed" && (
+              <>
+                <button className="btn-primary" onClick={saveItems} disabled={saving}>{saving ? "Đang lưu..." : "Lưu số thực tế"}</button>
+                <button className="btn-teal" onClick={complete} disabled={saving}>Hoàn tất kiểm kê</button>
+              </>
+            )}
+            <button className="btn-ghost" onClick={()=>setDetail(null)}>Đóng</button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+};
+
 // ══ APP ═══════════════════════════════════════════════════════════════════════
 const NAV = [
   { id:"dashboard", icon:"◈",  label:"Tổng quan"  },
@@ -1980,10 +2801,18 @@ const NAV = [
   { id:"products",  icon:"📦", label:"Sản phẩm"   },
   { id:"warehouses",icon:"🏗", label:"Kho hàng" },
   { id:"inventory", icon:"📋", label:"Tồn kho"  },
+  { id:"purchaseOrders", icon:"📥", label:"Nhập hàng" },
+  { id:"procurement", icon:"🧾", label:"Mua hàng" },
   { id:"customers", icon:"👥", label:"Khách hàng"  },
   { id:"orders",    icon:"🛒", label:"Đơn hàng"     },
+  { id:"returns",   icon:"↩",  label:"Trả hàng" },
+  { id:"stocktake", icon:"🧮", label:"Kiểm kê" },
 ];
-const PAGES = { dashboard:Dashboard, suppliers:Suppliers, products:Products, warehouses:Warehouses, inventory:Inventory, customers:Customers, orders:Orders };
+const PAGES = {
+  dashboard:Dashboard, suppliers:Suppliers, products:Products, warehouses:Warehouses,
+  inventory:Inventory, purchaseOrders:PurchaseOrders, procurement:PurchaseRequisitions,
+  customers:Customers, orders:Orders, returns:Returns, stocktake:Stocktake,
+};
 
 export default function App() {
   const initial = bootstrapAuth();
