@@ -1335,7 +1335,6 @@ const Dashboard = () => {
   const totalRevenue = T.Revenue !== undefined ? T.Revenue : totalBill;
   const pendingWorkflow = (T.PendingPR || 0) + (T.PendingCPR || 0) + (T.PendingReturns || 0) + (T.OpenPOs || 0);
 
-  const catData = p.reduce((acc,x) => { const k = catVi(x.Category); acc[k]=(acc[k]||0)+1; return acc; }, {});
   const pieColors = ["#E0574C","#EFC03A","#F7D575","#F0A040","#B0524A"];
   // Inventory VALUE per category comes from the API; never repeat product names
   const fallbackCatValue = {};
