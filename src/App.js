@@ -136,6 +136,10 @@ const setAuth = (screen, extra = {}) => {
     screen,
     username: extra.username || p.username || p.sub || "",
     role: extra.role || p.role || "admin",
+    full_name: extra.full_name || p.full_name || "",
+    organization_id: extra.organization_id !== undefined ? extra.organization_id : (p.organization_id ?? null),
+    customer_id: extra.customer_id !== undefined ? extra.customer_id : (p.customer_id ?? null),
+    organization: extra.organization || null,
   };
   localStorage.setItem(AUTH_KEY, JSON.stringify(auth));
   return auth;
@@ -155,6 +159,10 @@ const bootstrapAuth = () => {
   const user = {
     username: auth.username || p.username || p.sub || "admin",
     role: auth.role || p.role || "admin",
+    full_name: auth.full_name || p.full_name || "",
+    organization_id: auth.organization_id ?? p.organization_id ?? null,
+    customer_id: auth.customer_id ?? p.customer_id ?? null,
+    organization: auth.organization || null,
   };
   const screen = ["app", "login", "customer"].includes(auth.screen) ? auth.screen : "app";
   return { screen, user };
@@ -217,6 +225,18 @@ const STATUS_VI = {
   Accepted: "Đã duyệt", Pending: "Chờ duyệt", Rejected: "Từ chối", Cancelled: "Đã hủy",
   Ordered: "Đã đặt", Received: "Đã nhận", Draft: "Nháp", Pending_Approval: "Chờ duyệt",
   Approved: "Đã duyệt", In_Progress: "Đang kiểm", Completed: "Hoàn tất",
+  Submitted: "Chờ duyệt", Converted: "Đã chuyển SO", Sent: "Đã gửi NCC",
+  Partially_Received: "Nhận một phần", Processing: "Đang xử lý",
+  Active: "Hoạt động", Inactive: "Ngừng hoạt động",
+};
+const ROLE_VI = {
+  admin: "Quản trị viên", org_manager: "Quản lý tổ chức",
+  org_staff: "Nhân viên tổ chức", customer: "Khách hàng",
+};
+const TXN_VI = {
+  GoodsReceipt: "Nhập hàng (GRN)", SalesIssue: "Xuất bán", CustomerReturn: "Khách trả hàng",
+  ManualAdjustment: "Điều chỉnh tay", StocktakeAdjustment: "Điều chỉnh kiểm kê",
+  OpeningBalance: "Tồn đầu kỳ",
 };
 
 const GlassCard   = ({ children, style:s={}, gradient }) => (
@@ -358,6 +378,13 @@ const StatusBadge = ({ status }) => {
     Approved: { bg:"#DCFCE7", color:"#166534", border:"1px solid #BBF7D0" },
     In_Progress: { bg:"#DBEAFE", color:"#1D4ED8", border:"1px solid #BFDBFE" },
     Completed:{ bg:"#DCFCE7", color:"#14532D", border:"1px solid #86EFAC" },
+    Submitted: { bg:"#FEF3C7", color:"#92400E", border:"1px solid #FDE68A" },
+    Converted: { bg:"#DBEAFE", color:"#1D4ED8", border:"1px solid #BFDBFE" },
+    Sent:      { bg:"#DBEAFE", color:"#1D4ED8", border:"1px solid #BFDBFE" },
+    Partially_Received: { bg:"#FFEDD5", color:"#9A3412", border:"1px solid #FED7AA" },
+    Processing:{ bg:"#DBEAFE", color:"#1D4ED8", border:"1px solid #BFDBFE" },
+    Active:    { bg:"#DCFCE7", color:"#166534", border:"1px solid #BBF7D0" },
+    Inactive:  { bg:"#F3F4F6", color:"#374151", border:"1px solid #D1D5DB" },
   };
   const st = styles[s] || styles.Accepted;
   return (
@@ -702,8 +729,15 @@ const LoginPage = ({ onLogin, onCustomerPortal }) => {
     try {
       const res = await request("/auth/login", "POST", { username: form.username, password: form.password });
       localStorage.setItem("token", res.access_token);
-      setAuth("app", { username: form.username });
-      onLogin();
+      const auth = setAuth("app", {
+        username: form.username,
+        role: res.role,
+        full_name: res.full_name,
+        organization_id: res.organization_id,
+        customer_id: res.customer_id,
+        organization: res.organization,
+      });
+      onLogin(auth);
     } catch (e) {
       setErr(e.message || "Đăng nhập thất bại. Vui lòng kiểm tra lại tài khoản.");
       setLoading(false);
@@ -1262,13 +1296,15 @@ const CustomerPortal = ({ onBack }) => {
 // ══ DASHBOARD ══════════════════════════════════════════════════════════════════
 const Dashboard = () => {
   const [all, setAll]     = useState({ s:[], p:[], c:[], o:[], inv:[], wh:[] });
+  const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     Promise.all([
       apiFetch('/suppliers'), apiFetch('/products'), apiFetch('/customers'),
-      apiFetch('/orders'),    apiFetch('/inventory'), apiFetch('/warehouses')
-    ]).then(([s,p,c,o,inv,wh]) => { setAll({s,p,c,o,inv,wh}); setLoading(false); })
+      apiFetch('/orders'),    apiFetch('/inventory'), apiFetch('/warehouses'),
+      apiFetch('/dashboard/summary').catch(() => null),
+    ]).then(([s,p,c,o,inv,wh,sum]) => { setAll({s,p,c,o,inv,wh}); setSummary(sum); setLoading(false); })
       .catch(e => { showToast(e.message || "Không tải được dữ liệu tổng quan.", "error"); setLoading(false); });
   }, []);
 
@@ -1277,10 +1313,24 @@ const Dashboard = () => {
   const totalBill = o.filter(x => x.Status === "Accepted").reduce((a,x) => a + parseFloat(x.Bill), 0);
   const lowStock = inv.filter(i => i.QuantityAvailable < 50);
   const pendingOrders = o.filter(x => x.Status === "Pending");
+  const T = summary?.totals || {};
+  const totalRevenue = T.Revenue !== undefined ? T.Revenue : totalBill;
+  const pendingWorkflow = (T.PendingPR || 0) + (T.PendingCPR || 0) + (T.PendingReturns || 0) + (T.OpenPOs || 0);
 
   const catData = p.reduce((acc,x) => { const k = catVi(x.Category); acc[k]=(acc[k]||0)+1; return acc; }, {});
-  const pieData = Object.entries(catData).map(([name,value]) => ({name, value}));
   const pieColors = ["#E0574C","#EFC03A","#F7D575","#F0A040","#B0524A"];
+  // Inventory VALUE per category comes from the API; never repeat product names
+  const fallbackCatValue = {};
+  inv.forEach(i => {
+    const prod = p.find(x => x.ProductID === i.ProductID);
+    const k = catVi(prod?.Category);
+    fallbackCatValue[k] = (fallbackCatValue[k] || 0) + Number(i.QuantityAvailable || 0) * Number(prod?.UnitPrice || 0);
+  });
+  const apiCatValue = (summary?.inventoryByCategory || []).map(r => ({ name: catVi(r.Category), value: Number(r.Value) || 0 }));
+  const pieData = apiCatValue.length ? apiCatValue : Object.entries(fallbackCatValue).map(([name, value]) => ({ name, value }));
+  const flowData = (summary?.goodsFlow || []).map(r => ({ name: r.Month, Inbound: Number(r.Inbound) || 0, Outbound: Number(r.Outbound) || 0 }));
+  const revData = (summary?.monthlyRevenue || []).map(r => ({ name: r.Month, Revenue: Number(r.Revenue) || 0 }));
+  const topSuppliers = summary?.topSuppliers || [];
 
   const invData = inv.map(i => {
     const prod = p.find(x => x.ProductID===i.ProductID);
@@ -1322,11 +1372,30 @@ const Dashboard = () => {
         </div>
       )}
 
+      {pendingWorkflow > 0 && (
+        <div style={{ background:'#EFF6FF', border:'1px solid #BFDBFE', borderRadius:12, padding:'14px 20px', marginBottom:16, display:'flex', alignItems:'center', gap:14 }} className="fade-up">
+          <div style={{ fontSize:22 }}>📋</div>
+          <div>
+            <div style={{ fontWeight:700, fontSize:14, color:'#1D4ED8', marginBottom:3 }}>Công việc chờ xử lý — {pendingWorkflow} hồ sơ</div>
+            <div style={{ fontSize:12, color:'var(--muted)' }}>
+              PR chờ duyệt: {T.PendingPR || 0} · Yêu cầu KH: {T.PendingCPR || 0} · Trả hàng: {T.PendingReturns || 0} · PO đang mở: {T.OpenPOs || 0}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:16, marginBottom:16 }}>
+        <StatCard label="Nhà cung cấp"   value={T.SupplierCount ?? s.length} sub="đã đăng ký"          gradient="#DA251D,#FFCD00" icon="🏭" />
+        <StatCard label="Sản phẩm"    value={T.ProductCount ?? p.length} sub="trong danh mục"          gradient="#FFCD00,#B71C1C" icon="📦" />
+        <StatCard label="Khách hàng"   value={T.CustomerCount ?? c.length} sub={`${T.OrganizationCount ?? 0} tổ chức`} gradient="#FFE082,#DA251D" icon="👥" />
+        <StatCard label="Tổng doanh thu" value={fmtVnd(totalRevenue)} sub="đơn hợp lệ" gradient="#FF8F00,#FFCD00" icon="💰" />
+      </div>
+
       <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:16, marginBottom:24 }}>
-        <StatCard label="Nhà cung cấp"   value={s.length} sub="đã đăng ký"          gradient="#DA251D,#FFCD00" icon="🏭" />
-        <StatCard label="Sản phẩm"    value={p.length} sub="trong danh mục"          gradient="#FFCD00,#B71C1C" icon="📦" />
-        <StatCard label="Khách hàng"   value={c.length} sub="đã đăng ký"          gradient="#FFE082,#DA251D" icon="👥" />
-        <StatCard label="Tổng doanh thu" value={fmtVnd(totalBill)} sub="từ đơn đã duyệt" gradient="#FF8F00,#FFCD00" icon="💰" />
+        <StatCard label="Tồn kho" value={(T.InventoryUnits ?? inv.reduce((a,i)=>a+Number(i.QuantityAvailable||0),0)).toLocaleString('vi-VN')} sub="đơn vị trong kho" gradient="#0EA5E9,#22D3EE" icon="📊" />
+        <StatCard label="Giá trị tồn kho" value={fmtVnd(T.InventoryValue || 0)} sub="theo giá bán" gradient="#10B981,#34D399" icon="🏷" />
+        <StatCard label="Tồn thấp" value={T.LowStockCount ?? lowStock.length} sub="mặt hàng dưới ngưỡng" gradient="#F59E0B,#FBBF24" icon="⚠️" />
+        <StatCard label="Người dùng tổ chức" value={T.OrgUserCount ?? 0} sub="org_manager + org_staff" gradient="#8B5CF6,#A78BFA" icon="🧑‍💼" />
       </div>
 
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16, marginBottom:20 }}>
@@ -1346,7 +1415,7 @@ const Dashboard = () => {
         </GlassCard>
 
         <GlassCard gradient="#FFCD00,#FF8F00">
-          <div style={{ fontFamily:"var(--font-head)", fontWeight:600, fontSize:15, marginBottom:18 }}>🍩 Danh mục sản phẩm</div>
+          <div style={{ fontFamily:"var(--font-head)", fontWeight:600, fontSize:15, marginBottom:18 }}>🍩 Giá trị tồn kho theo danh mục</div>
           <ResponsiveContainer width="100%" height={200}>
             <PieChart>
               <Pie data={pieData} cx="50%" cy="50%" innerRadius={55} outerRadius={85} paddingAngle={4} dataKey="value" animationBegin={0} animationDuration={1000}>
@@ -1359,7 +1428,7 @@ const Dashboard = () => {
             {pieData.map((d,i) => (
               <div key={d.name} style={{ display:"flex", alignItems:"center", gap:6 }}>
                 <div style={{ width:8, height:8, borderRadius:"50%", background:pieColors[i] }} />
-                <span style={{ fontSize:11, color:"var(--muted)" }}>{d.name} ({d.value})</span>
+                <span style={{ fontSize:11, color:"var(--muted)" }}>{d.name} · {fmtVnd(d.value)}</span>
               </div>
             ))}
           </div>
@@ -1397,6 +1466,65 @@ const Dashboard = () => {
           ))}
         </GlassCard>
       </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16, marginTop:16 }}>
+        <GlassCard gradient="#0EA5E9,#22D3EE">
+          <div style={{ fontFamily:"var(--font-head)", fontWeight:600, fontSize:15, marginBottom:18 }}>📈 Nhập / xuất kho theo tháng</div>
+          {flowData.length === 0 ? (
+            <div style={{ fontSize:13, color:"var(--muted)", padding:"30px 0", textAlign:"center" }}>Chưa có giao dịch kho.</div>
+          ) : (
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={flowData} margin={{top:0,right:0,left:-20,bottom:0}}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB" />
+                <XAxis dataKey="name" tick={{fontSize:10, fill:"#6B7280"}} />
+                <YAxis tick={{fontSize:10, fill:"#6B7280"}} />
+                <Tooltip content={<CustomTooltip />} />
+                <Bar dataKey="Inbound"  name="Nhập kho" fill="#10B981" radius={[4,4,0,0]} />
+                <Bar dataKey="Outbound" name="Xuất kho" fill="#EF4444" radius={[4,4,0,0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          )}
+        </GlassCard>
+
+        <GlassCard gradient="#10B981,#34D399">
+          <div style={{ fontFamily:"var(--font-head)", fontWeight:600, fontSize:15, marginBottom:18 }}>💰 Doanh thu theo tháng</div>
+          {revData.length === 0 ? (
+            <div style={{ fontSize:13, color:"var(--muted)", padding:"30px 0", textAlign:"center" }}>Chưa có dữ liệu doanh thu.</div>
+          ) : (
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={revData} margin={{top:0,right:0,left:-20,bottom:0}}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB" />
+                <XAxis dataKey="name" tick={{fontSize:10, fill:"#6B7280"}} />
+                <YAxis tick={{fontSize:10, fill:"#6B7280"}} tickFormatter={v => `${Math.round(v/1000000)}tr`} />
+                <Tooltip content={<CustomTooltip />} />
+                <Bar dataKey="Revenue" name="Doanh thu" fill="#DA251D" radius={[4,4,0,0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          )}
+        </GlassCard>
+      </div>
+
+      <GlassCard style={{ marginTop:16, padding:0, overflow:"hidden" }}>
+        <div style={{ padding:"14px 18px", borderBottom:"1px solid #E5E7EB", fontWeight:600 }}>🏭 Top nhà cung cấp theo giá trị mua hàng</div>
+        {topSuppliers.length === 0 ? (
+          <div style={{ fontSize:13, color:"var(--muted)", padding:"24px 18px" }}>Chưa có đơn mua hàng.</div>
+        ) : (
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+              <TableHeader cols={["Nhà cung cấp","Số đơn mua","Giá trị mua hàng"]} />
+              <tbody>
+                {topSuppliers.map(s => (
+                  <tr key={s.SupplierID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
+                    <td style={{ padding:"10px 16px", fontWeight:600, whiteSpace:"nowrap" }}>{s.SupplierName}</td>
+                    <td style={{ padding:"10px 16px", textAlign:"right" }}>{s.OrderCount}</td>
+                    <td style={{ padding:"10px 16px", textAlign:"right", fontWeight:600, whiteSpace:"nowrap" }}>{fmtVnd(s.PurchaseValue)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </GlassCard>
     </div>
   );
 };
@@ -1974,7 +2102,8 @@ const Customers = () => {
 };
 
 // ══ ORDERS ════════════════════════════════════════════════════════════════════
-const Orders = ({ refreshPending }) => {
+const Orders = ({ refreshPending, role }) => {
+  const isOrgView = ORG_ROLE_IDS.includes(role);
   const [data, setData]         = useState([]);
   const [customers, setCustomers] = useState([]);
   const [products, setProducts] = useState([]);
@@ -1990,11 +2119,16 @@ const Orders = ({ refreshPending }) => {
 
   const load = useCallback(() => {
     setLoading(true);
-    Promise.all([apiFetch('/orders'), apiFetch('/customers'), apiFetch('/products')]).then(([o,c,p])=>{
-      setData(o); setCustomers(c); setProducts(p); setLoading(false);
+    const reqs = isOrgView
+      ? [apiFetch('/orders'), apiFetch('/products')]
+      : [apiFetch('/orders'), apiFetch('/customers'), apiFetch('/products')];
+    Promise.all(reqs).then(([o,a,b])=>{
+      if (isOrgView) { setData(o); setProducts(a); setCustomers([]); }
+      else { setData(o); setCustomers(a); setProducts(b); }
+      setLoading(false);
       if (refreshPending) refreshPending();
     }).catch(e=>{showToast(e.message||'Không tải được đơn hàng.','error');setLoading(false);});
-  },[refreshPending]);
+  },[refreshPending, isOrgView]);
   useEffect(()=>{load();},[load]);
 
   const save = async () => {
@@ -2021,7 +2155,8 @@ const Orders = ({ refreshPending }) => {
 
   const filtered = data.filter(o => {
     const c = customers.find(x=>x.CustomerID===o.CustomerID);
-    const matchSearch = c?.CustomerName.toLowerCase().includes(search.toLowerCase()) || o.OrderID.includes(search);
+    const custName = c?.CustomerName || o.CustomerName || "";
+    const matchSearch = custName.toLowerCase().includes(search.toLowerCase()) || o.OrderID.includes(search);
     const matchStatus = statusFilter === "All" || (o.Status||"Accepted") === statusFilter;
     const matchFrom = !dateFrom || o.OrderDate >= dateFrom;
     const matchTo = !dateTo || o.OrderDate <= dateTo;
@@ -2037,7 +2172,7 @@ const Orders = ({ refreshPending }) => {
     return {
       OrderID: o.OrderID,
       OrderDate: o.OrderDate,
-      Customer: cust?.CustomerName || o.CustomerID,
+      Customer: cust?.CustomerName || o.CustomerName || o.CustomerID,
       Product: `${prod?.ProductName || o.ProductID || ""}${o.Quantity > 1 ? ` × ${o.Quantity}` : ""}`,
       Amount: Number(o.Bill) || 0,
       Status: STATUS_VI[o.Status] || o.Status || "",
@@ -2136,7 +2271,7 @@ const Orders = ({ refreshPending }) => {
                     </td>
                     <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{o.OrderDate}</td>
                     <td style={{ padding:"12px 16px", fontWeight:700, color:"#1F2937" }}>{fmtVnd(o.Bill)}</td>
-                    <td style={{ padding:"12px 16px", fontWeight:600 }}>{cust?.CustomerName||o.CustomerID}</td>
+                    <td style={{ padding:"12px 16px", fontWeight:600 }}>{cust?.CustomerName||o.CustomerName||o.CustomerID}</td>
                     <td style={{ padding:"12px 16px" }}>
                       <span style={{ background:"#FEF2F2", color:"#DA251D", border:"1px solid #FECACA", padding:"3px 10px", borderRadius:6, fontSize:11 }}>
                         {prod?.ProductName||o.ProductID||"—"}{o.Quantity > 1 ? ` × ${o.Quantity}` : ""}
@@ -2146,7 +2281,9 @@ const Orders = ({ refreshPending }) => {
                       <StatusBadge status={o.Status} />
                     </td>
                     <td style={{ padding:"12px 16px" }}>
-                      {(o.Status === "Pending" || !o.Status) ? (
+                      {isOrgView ? (
+                        <span style={{ color:"var(--muted-2)", fontSize:12 }}>Chỉ xem</span>
+                      ) : (o.Status === "Pending" || !o.Status) ? (
                         <div style={{ display:"flex", gap:6 }}>
                           <button onClick={()=>updateStatus(o.OrderID,"Accepted")} style={{ background:"#DCFCE7", border:"1px solid #BBF7D0", color:"#166534", cursor:"pointer", borderRadius:8, fontSize:12, padding:"5px 10px", fontFamily:"var(--font-body)" }}>✓ Chấp nhận</button>
                           <button onClick={()=>updateStatus(o.OrderID,"Rejected")} className="btn-danger" style={{ padding:"5px 10px", fontSize:12 }}>✗ Từ chối</button>
@@ -2154,7 +2291,7 @@ const Orders = ({ refreshPending }) => {
                       ) : (
                         <div style={{ display:"flex", gap:8 }}>
                           <button className="btn-ghost" onClick={()=>{setForm({...o});setModal("edit");}} style={{ padding:"5px 12px", fontSize:12 }}>Sửa</button>
-                          <button className="btn-danger" onClick={()=>setDelTarget({id:o.OrderID,name:`${o.OrderID} (${cust?.CustomerName||o.CustomerID})`})} style={{ padding:"5px 12px", fontSize:12 }}>Xóa</button>
+                          <button className="btn-danger" onClick={()=>setDelTarget({id:o.OrderID,name:`${o.OrderID} (${cust?.CustomerName||o.CustomerName||o.CustomerID})`})} style={{ padding:"5px 12px", fontSize:12 }}>Xóa</button>
                         </div>
                       )}
                     </td>
@@ -2240,15 +2377,17 @@ const PurchaseOrders = () => {
   const [data, setData] = useState([]);
   const [products, setProducts] = useState([]);
   const [suppliers, setSuppliers] = useState([]);
+  const [warehouses, setWarehouses] = useState([]);
   const [loading, setLoading] = useState(true);
   const [modal, setModal] = useState(false);
   const [form, setForm] = useState({});
-  const [receiveTarget, setReceiveTarget] = useState(null);
+  const [receiptTarget, setReceiptTarget] = useState(null);
+  const [receiptForm, setReceiptForm] = useState({ WarehouseID: "", Notes: "", Lines: {} });
 
   const load = useCallback(() => {
     setLoading(true);
-    Promise.all([apiFetch('/purchase-orders'), apiFetch('/products'), apiFetch('/suppliers')])
-      .then(([po, p, s]) => { setData(po); setProducts(p); setSuppliers(s); setLoading(false); })
+    Promise.all([apiFetch('/purchase-orders'), apiFetch('/products'), apiFetch('/suppliers'), apiFetch('/warehouses')])
+      .then(([po, p, s, w]) => { setData(po); setProducts(p); setSuppliers(s); setWarehouses(w); setLoading(false); })
       .catch(e => { showToast(e.message || 'Không tải được đơn mua hàng.', 'error'); setLoading(false); });
   }, []);
   useEffect(() => { load(); }, [load]);
@@ -2278,15 +2417,45 @@ const PurchaseOrders = () => {
     } catch (e) { showToast(e.message || 'Tạo đơn mua hàng thất bại.', 'error'); }
   };
 
-  const receive = async () => {
+  const sendToSupplier = async (po) => {
+    if (!window.confirm(`Gửi đơn ${po.POID} tới nhà cung cấp ${po.SupplierName}?`)) return;
     try {
-      const res = await apiPatch(`/purchase-orders/${receiveTarget.POID}/receive`);
-      showToast(`Đã nhập kho ${receiveTarget.POID}: ${res.OldQuantity} → ${res.NewQuantity}.`);
-      setReceiveTarget(null); load();
-    } catch (e) { showToast(e.message || 'Nhập kho thất bại.', 'error'); }
+      await apiPatch(`/purchase-orders/${po.POID}/status`, { Status: "Sent" });
+      showToast(`Đã gửi ${po.POID} tới nhà cung cấp.`);
+      load();
+    } catch (e) { showToast(e.message || 'Gửi đơn mua thất bại.', 'error'); }
   };
 
-  const orderedCount = data.filter(po => po.Status === 'Ordered').length;
+  const openReceipt = (po) => {
+    const lines = {};
+    (po.Items || []).forEach(it => {
+      const remaining = Number(it.Quantity) - Number(it.ReceivedQuantity || 0);
+      if (remaining > 0) lines[it.ProductID] = remaining;
+    });
+    setReceiptTarget(po);
+    setReceiptForm({ WarehouseID: po.WarehouseID || warehouses[0]?.WarehouseID || "", Notes: "", Lines: lines });
+  };
+
+  const submitReceipt = async () => {
+    const items = Object.entries(receiptForm.Lines)
+      .filter(([, q]) => String(q) !== "" && Number(q) > 0)
+      .map(([ProductID, QuantityReceived]) => ({ ProductID, QuantityReceived: parseInt(QuantityReceived, 10) }));
+    if (items.length === 0) { showToast('Nhập số lượng nhận cho ít nhất một dòng.', 'error'); return; }
+    if (items.some(it => Number.isNaN(it.QuantityReceived) || it.QuantityReceived < 1)) {
+      showToast('Số lượng nhận phải là số nguyên dương.', 'error'); return;
+    }
+    try {
+      const res = await apiPost(`/purchase-orders/${receiptTarget.POID}/receipts`, {
+        WarehouseID: receiptForm.WarehouseID || undefined,
+        Notes: receiptForm.Notes || undefined,
+        Items: items,
+      });
+      showToast(`Đã tạo phiếu ${res.GRNID} · ${res.Status === "Received" ? "đã nhận đủ hàng" : "nhận một phần"}.`);
+      setReceiptTarget(null); load();
+    } catch (e) { showToast(e.message || 'Nhận hàng thất bại.', 'error'); }
+  };
+
+  const openCount = data.filter(po => po.Status === 'Ordered').length;
   const receivedValue = data.filter(po => po.Status === 'Received').reduce((a, po) => a + Number(po.TotalAmount || 0), 0);
   const addBtn = <button className="btn-primary" onClick={openAdd}>+ Tạo đơn mua</button>;
 
@@ -2295,7 +2464,7 @@ const PurchaseOrders = () => {
       <PageHeader
         crumb="NHẬP HÀNG"
         title="Đơn mua hàng"
-        sub={`${data.length} đơn mua · ${orderedCount} chờ nhập kho · Đã nhập: ${fmtVnd(receivedValue)}`}
+        sub={`${data.length} đơn mua · ${openCount} chờ gửi/nhập kho · Đã nhập đủ: ${fmtVnd(receivedValue)}`}
         action={addBtn}
       />
       {loading ? (
@@ -2307,27 +2476,48 @@ const PurchaseOrders = () => {
       ) : (
         <GlassCard style={{ padding:0, overflow:"hidden" }}>
           <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
-            <TableHeader cols={["Mã đơn","Nhà cung cấp","Sản phẩm","SL","Đơn giá","Tổng tiền","Ngày đặt","Trạng thái","Thao tác"]} />
+            <TableHeader cols={["Mã đơn","Nhà cung cấp","Mặt hàng","Tổng SL","Đã nhận","Tổng tiền","Ngày đặt","Trạng thái","Thao tác"]} />
             <tbody>
-              {data.map(po => (
+              {data.map(po => {
+                const total = Number(po.TotalQuantity ?? po.Quantity ?? 0);
+                const received = Number(po.ReceivedQuantity ?? 0);
+                const canReceive = ["Ordered","Sent","Partially_Received"].includes(po.Status);
+                return (
                 <tr key={po.POID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
                   <td style={{ padding:"12px 16px" }}><IdBadge id={po.POID} />{po.PRID && <div style={{ fontSize:10, color:"var(--muted)", marginTop:3 }}>từ {po.PRID}</div>}</td>
                   <td style={{ padding:"12px 16px", fontWeight:600 }}>{po.SupplierName}</td>
-                  <td style={{ padding:"12px 16px" }}>{po.ProductName}</td>
-                  <td style={{ padding:"12px 16px", textAlign:"right" }}>{po.Quantity} {po.Unit || ""}</td>
-                  <td style={{ padding:"12px 16px", textAlign:"right" }}>{fmtVnd(po.UnitPrice)}</td>
+                  <td style={{ padding:"12px 16px", maxWidth:220 }}>
+                    <div style={{ whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }} title={(po.Items||[]).map(i=>`${i.ProductName} ×${i.Quantity}`).join(", ")}>
+                      {(po.Items||[]).map(i=>i.ProductName).join(", ") || po.ProductName}
+                    </div>
+                    <div style={{ fontSize:11, color:"var(--muted)", marginTop:2 }}>{po.ItemCount ?? (po.Items||[]).length} mặt hàng</div>
+                  </td>
+                  <td style={{ padding:"12px 16px", textAlign:"right" }}>{total}</td>
+                  <td style={{ padding:"12px 16px", textAlign:"right", color: received >= total ? "#15803D" : "var(--muted)", fontWeight: received >= total ? 700 : 400 }}>{received}/{total}</td>
                   <td style={{ padding:"12px 16px", textAlign:"right", fontWeight:700, color:"#1F2937" }}>{fmtVnd(po.TotalAmount)}</td>
                   <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{po.OrderDate}</td>
                   <td style={{ padding:"12px 16px" }}><StatusBadge status={po.Status} /></td>
                   <td style={{ padding:"12px 16px" }}>
-                    {po.Status === "Ordered" ? (
-                      <button className="btn-primary" onClick={()=>setReceiveTarget(po)} style={{ padding:"5px 12px", fontSize:12 }}>Nhận hàng</button>
-                    ) : (
-                      <span style={{ color:"var(--muted-2)", fontSize:12 }}>—</span>
-                    )}
+                    <div style={{ display:"flex", gap:6 }}>
+                      {po.Status === "Ordered" && (
+                        <button className="btn-ghost" onClick={()=>sendToSupplier(po)} style={{ padding:"5px 10px", fontSize:12 }}>Gửi NCC</button>
+                      )}
+                      {canReceive && (
+                        <button className="btn-primary" onClick={()=>openReceipt(po)} style={{ padding:"5px 12px", fontSize:12 }}>Nhận hàng</button>
+                      )}
+                      {po.Status === "Received" && (
+                        <button className="btn-ghost" onClick={async () => {
+                          try { await apiPatch(`/purchase-orders/${po.POID}/status`, { Status: "Completed" }); showToast(`Đã hoàn tất ${po.POID}.`); load(); }
+                          catch (e) { showToast(e.message || 'Cập nhật thất bại.', 'error'); }
+                        }} style={{ padding:"5px 10px", fontSize:12 }}>Hoàn tất</button>
+                      )}
+                      {!canReceive && po.Status !== "Ordered" && po.Status !== "Received" && (
+                        <span style={{ color:"var(--muted-2)", fontSize:12 }}>—</span>
+                      )}
+                    </div>
                   </td>
                 </tr>
-              ))}
+              );})}
             </tbody>
           </table>
         </GlassCard>
@@ -2365,18 +2555,47 @@ const PurchaseOrders = () => {
         </Modal>
       )}
 
-      {receiveTarget && (
-        <Modal title="Xác nhận nhập kho" onClose={()=>setReceiveTarget(null)}>
-          <div style={{ marginBottom:20 }}>
-            <div style={{ color:'var(--muted)', fontSize:13, marginBottom:8 }}>Hàng sẽ được cộng vào tồn kho:</div>
+      {receiptTarget && (
+        <Modal title={`Nhận hàng · ${receiptTarget.POID}`} onClose={()=>setReceiptTarget(null)}>
+          <div style={{ marginBottom:18 }}>
             <div style={{ background:'#F0FDF4', border:'1px solid #BBF7D0', borderRadius:10, padding:'10px 14px', fontSize:14 }}>
-              <div style={{ fontWeight:600 }}>{receiveTarget.POID} · {receiveTarget.ProductName}</div>
-              <div style={{ color:"#475569", marginTop:4 }}>{receiveTarget.SupplierName} · {receiveTarget.Quantity} {receiveTarget.Unit || ""} · {fmtVnd(receiveTarget.TotalAmount)}</div>
+              <div style={{ fontWeight:600 }}>{receiptTarget.POID} · {receiptTarget.SupplierName}</div>
+              <div style={{ color:"#475569", marginTop:4 }}>{receiptTarget.ItemCount ?? (receiptTarget.Items||[]).length} mặt hàng · {fmtVnd(receiptTarget.TotalAmount)}</div>
             </div>
           </div>
-          <div style={{ display:'flex', gap:10 }}>
-            <button className="btn-primary" onClick={receive}>Nhập kho</button>
-            <button className="btn-ghost" onClick={()=>setReceiveTarget(null)}>Hủy</button>
+          <div style={{ display:"grid", gap:12 }}>
+            <div><Label>KHO NHẬN</Label>
+              <GlassSelect value={receiptForm.WarehouseID} onChange={e=>setReceiptForm({...receiptForm, WarehouseID:e.target.value})} style={{width:"100%"}}>
+                {warehouses.map(w=><option key={w.WarehouseID} value={w.WarehouseID}>{w.WarehouseID} · {w.WarehouseName}</option>)}
+              </GlassSelect>
+            </div>
+            <div>
+              <Label>SỐ LƯỢNG NHẬN TỪNG MẶT HÀNG</Label>
+              <div style={{ display:"grid", gap:8 }}>
+                {(receiptTarget.Items||[]).map(it => {
+                  const remaining = Number(it.Quantity) - Number(it.ReceivedQuantity||0);
+                  return (
+                    <div key={it.ProductID} style={{ display:"grid", gridTemplateColumns:"1fr 110px", gap:10, alignItems:"center", background:"#F8FAFC", border:"1px solid #E2E8F0", borderRadius:10, padding:"8px 12px" }}>
+                      <div>
+                        <div style={{ fontWeight:600, fontSize:13 }}>{it.ProductName}</div>
+                        <div style={{ fontSize:11, color:"var(--muted)" }}>Đặt {it.Quantity} · đã nhận {it.ReceivedQuantity||0} · còn {Math.max(remaining,0)}</div>
+                      </div>
+                      <GlassInput type="number" min={0} max={Math.max(remaining,0)} disabled={remaining<=0}
+                        value={receiptForm.Lines[it.ProductID] ?? ""}
+                        onChange={e=>setReceiptForm({...receiptForm, Lines:{...receiptForm.Lines, [it.ProductID]: e.target.value}})} />
+                    </div>
+                  );
+                })}
+                {(receiptTarget.Items||[]).every(it => Number(it.Quantity) <= Number(it.ReceivedQuantity||0)) && (
+                  <div style={{ fontSize:13, color:"var(--muted)" }}>Đơn này đã nhận đủ hàng.</div>
+                )}
+              </div>
+            </div>
+            <div><Label>GHI CHÚ</Label><GlassInput value={receiptForm.Notes} onChange={e=>setReceiptForm({...receiptForm, Notes:e.target.value})} placeholder="Ví dụ: nhận đợt 1, hàng đủ điều kiện..." /></div>
+            <div style={{ display:'flex', gap:10, marginTop:4 }}>
+              <button className="btn-primary" onClick={submitReceipt}>Tạo phiếu nhập kho</button>
+              <button className="btn-ghost" onClick={()=>setReceiptTarget(null)}>Hủy</button>
+            </div>
           </div>
         </Modal>
       )}
@@ -2389,28 +2608,45 @@ const PurchaseRequisitions = () => {
   const [data, setData] = useState([]);
   const [products, setProducts] = useState([]);
   const [suppliers, setSuppliers] = useState([]);
+  const [warehouses, setWarehouses] = useState([]);
   const [loading, setLoading] = useState(true);
   const [modal, setModal] = useState(false);
-  const [form, setForm] = useState({ ProductID:"", Quantity:1 });
+  const [form, setForm] = useState({ Lines: [{ ProductID:"", Quantity:1 }], Reason:"", WarehouseID:"" });
   const [poTarget, setPoTarget] = useState(null);
-  const [poForm, setPoForm] = useState({ SupplierID:"", UnitPrice:0, OrderDate:"" });
+  const [poForm, setPoForm] = useState({ SupplierID:"", OrderDate:"", WarehouseID:"" });
 
   const load = useCallback(() => {
     setLoading(true);
-    Promise.all([apiFetch('/purchase-requisitions'), apiFetch('/products'), apiFetch('/suppliers')])
-      .then(([pr, p, s]) => { setData(pr); setProducts(p); setSuppliers(s); setLoading(false); })
+    Promise.all([apiFetch('/purchase-requisitions'), apiFetch('/products'), apiFetch('/suppliers'), apiFetch('/warehouses')])
+      .then(([pr, p, s, w]) => { setData(pr); setProducts(p); setSuppliers(s); setWarehouses(w); setLoading(false); })
       .catch(e => { showToast(e.message || 'Không tải được yêu cầu mua hàng.', 'error'); setLoading(false); });
   }, []);
   useEffect(() => { load(); }, [load]);
 
-  const openAdd = () => { setForm({ ProductID: products[0]?.ProductID || "", Quantity: 1 }); setModal(true); };
+  const openAdd = () => {
+    setForm({ Lines: [{ ProductID: products[0]?.ProductID || "", Quantity: 1 }], Reason: "", WarehouseID: warehouses[0]?.WarehouseID || "" });
+    setModal(true);
+  };
+
+  const setLine = (idx, patch) => {
+    setForm(f => ({ ...f, Lines: f.Lines.map((l, i) => i === idx ? { ...l, ...patch } : l) }));
+  };
+  const addLine = () => setForm(f => ({ ...f, Lines: [...f.Lines, { ProductID: products[0]?.ProductID || "", Quantity: 1 }] }));
+  const removeLine = (idx) => setForm(f => ({ ...f, Lines: f.Lines.filter((_, i) => i !== idx) }));
 
   const save = async () => {
-    const quantity = parseInt(form.Quantity, 10);
-    if (!form.ProductID || !quantity || quantity < 1) { showToast('Chọn sản phẩm và số lượng hợp lệ.', 'error'); return; }
+    const items = form.Lines.map(l => ({ ProductID: l.ProductID, Quantity: parseInt(l.Quantity, 10) }));
+    if (items.some(it => !it.ProductID)) { showToast('Chọn sản phẩm cho mọi dòng hàng.', 'error'); return; }
+    if (items.some(it => Number.isNaN(it.Quantity) || it.Quantity < 1)) { showToast('Số lượng phải là số nguyên dương.', 'error'); return; }
+    const ids = items.map(it => it.ProductID);
+    if (new Set(ids).size !== ids.length) { showToast('Mỗi sản phẩm chỉ được xuất hiện một lần.', 'error'); return; }
     try {
-      const res = await apiPost('/purchase-requisitions', { ProductID: form.ProductID, Quantity: quantity });
-      showToast(`Đã tạo yêu cầu ${res.PRID}.`);
+      const res = await apiPost('/purchase-requisitions', {
+        Items: items,
+        Reason: form.Reason || undefined,
+        WarehouseID: form.WarehouseID || undefined,
+      });
+      showToast(`Đã tạo yêu cầu ${res.PRID} · ${res.ItemCount} mặt hàng.`);
       setModal(false); load();
     } catch (e) { showToast(e.message || 'Tạo yêu cầu mua hàng thất bại.', 'error'); }
   };
@@ -2427,21 +2663,19 @@ const PurchaseRequisitions = () => {
     setPoTarget(pr);
     setPoForm({
       SupplierID: suppliers[0]?.SupplierID || "",
-      UnitPrice: Number(pr.UnitPrice) || 0,
       OrderDate: new Date().toISOString().slice(0, 10),
+      WarehouseID: pr.WarehouseID || warehouses[0]?.WarehouseID || "",
     });
   };
 
   const createPO = async () => {
     if (!poForm.SupplierID) { showToast('Chọn nhà cung cấp.', 'error'); return; }
-    const unitPrice = Number(poForm.UnitPrice);
-    if (Number.isNaN(unitPrice) || unitPrice < 0) { showToast('Đơn giá không hợp lệ.', 'error'); return; }
     try {
       const res = await apiPost('/purchase-orders', {
         PRID: poTarget.PRID,
         SupplierID: poForm.SupplierID,
-        UnitPrice: unitPrice,
         OrderDate: poForm.OrderDate,
+        WarehouseID: poForm.WarehouseID || undefined,
       });
       showToast(`Đã tạo đơn mua ${res.POID} từ ${poTarget.PRID}.`);
       setPoTarget(null); load();
@@ -2468,13 +2702,18 @@ const PurchaseRequisitions = () => {
       ) : (
         <GlassCard style={{ padding:0, overflow:"hidden" }}>
           <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
-            <TableHeader cols={["Mã yêu cầu","Sản phẩm","SL","Người yêu cầu","Ngày tạo","Trạng thái","Thao tác"]} />
+            <TableHeader cols={["Mã yêu cầu","Mặt hàng","Tổng SL","Người yêu cầu","Ngày tạo","Trạng thái","Thao tác"]} />
             <tbody>
               {data.map(pr => (
                 <tr key={pr.PRID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
-                  <td style={{ padding:"12px 16px" }}><IdBadge id={pr.PRID} /></td>
-                  <td style={{ padding:"12px 16px", fontWeight:600 }}>{pr.ProductName}</td>
-                  <td style={{ padding:"12px 16px", textAlign:"right" }}>{pr.Quantity} {pr.Unit || ""}</td>
+                  <td style={{ padding:"12px 16px" }}><IdBadge id={pr.PRID} />{pr.Reason && <div style={{ fontSize:10, color:"var(--muted)", marginTop:3, maxWidth:160, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }} title={pr.Reason}>{pr.Reason}</div>}</td>
+                  <td style={{ padding:"12px 16px", fontWeight:600, maxWidth:260 }}>
+                    <div style={{ whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }} title={(pr.Items||[]).map(i=>`${i.ProductName} ×${i.Quantity}`).join(", ")}>
+                      {(pr.Items||[]).map(i=>i.ProductName).join(", ") || pr.ProductName}
+                    </div>
+                    <div style={{ fontSize:11, color:"var(--muted)", marginTop:2 }}>{pr.ItemCount ?? (pr.Items||[]).length} mặt hàng</div>
+                  </td>
+                  <td style={{ padding:"12px 16px", textAlign:"right" }}>{(pr.Items||[]).reduce((a,i)=>a+Number(i.Quantity||0),0) || pr.Quantity}</td>
                   <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{pr.RequestedBy}</td>
                   <td style={{ padding:"12px 16px", color:"var(--muted)" }}>{String(pr.CreatedAt).slice(0, 10)}</td>
                   <td style={{ padding:"12px 16px" }}><StatusBadge status={pr.Status} /></td>
@@ -2500,12 +2739,28 @@ const PurchaseRequisitions = () => {
       {modal && (
         <Modal title="Tạo yêu cầu mua hàng" onClose={()=>setModal(false)}>
           <div style={{ display:"grid", gap:14 }}>
-            <div><Label>SẢN PHẨM</Label>
-              <GlassSelect value={form.ProductID} onChange={e=>setForm({...form,ProductID:e.target.value})} style={{width:"100%"}}>
-                {products.map(p=><option key={p.ProductID} value={p.ProductID}>{p.ProductName}</option>)}
+            <div>
+              <Label>DÒNG HÀNG</Label>
+              <div style={{ display:"grid", gap:8 }}>
+                {form.Lines.map((line, idx) => (
+                  <div key={idx} style={{ display:"grid", gridTemplateColumns:"1fr 90px 34px", gap:8, alignItems:"center" }}>
+                    <GlassSelect value={line.ProductID} onChange={e=>setLine(idx,{ProductID:e.target.value})} style={{width:"100%"}}>
+                      {products.map(p=><option key={p.ProductID} value={p.ProductID}>{p.ProductName}</option>)}
+                    </GlassSelect>
+                    <GlassInput type="number" min={1} value={line.Quantity} onChange={e=>setLine(idx,{Quantity:e.target.value})} />
+                    <button className="btn-ghost" onClick={()=>removeLine(idx)} disabled={form.Lines.length<=1} title="Xóa dòng" style={{ padding:"6px 0", fontSize:13 }}>✕</button>
+                  </div>
+                ))}
+              </div>
+              <button className="btn-ghost" onClick={addLine} style={{ marginTop:8, padding:"6px 12px", fontSize:12 }}>+ Thêm dòng</button>
+            </div>
+            <div><Label>KHO ĐÍCH</Label>
+              <GlassSelect value={form.WarehouseID} onChange={e=>setForm({...form,WarehouseID:e.target.value})} style={{width:"100%"}}>
+                <option value="">— Không chỉ định —</option>
+                {warehouses.map(w=><option key={w.WarehouseID} value={w.WarehouseID}>{w.WarehouseID} · {w.WarehouseName}</option>)}
               </GlassSelect>
             </div>
-            <div><Label>SỐ LƯỢNG</Label><GlassInput type="number" min={1} value={form.Quantity||1} onChange={e=>setForm({...form,Quantity:e.target.value})} /></div>
+            <div><Label>LÝ DO</Label><GlassInput value={form.Reason} onChange={e=>setForm({...form,Reason:e.target.value})} placeholder="Ví dụ: bổ sung tồn kho tháng 11..." maxLength={255} /></div>
             <div style={{ display:"flex", gap:10, marginTop:4 }}>
               <button className="btn-primary" onClick={save}>Gửi yêu cầu</button>
               <button className="btn-ghost" onClick={()=>setModal(false)}>Hủy</button>
@@ -2517,8 +2772,14 @@ const PurchaseRequisitions = () => {
       {poTarget && (
         <Modal title={`Tạo đơn mua từ ${poTarget.PRID}`} onClose={()=>setPoTarget(null)}>
           <div style={{ display:"grid", gap:14 }}>
-            <div style={{ background:"#F8FAFC", border:"1px solid #E2E8F0", borderRadius:10, padding:"10px 14px", fontSize:13, color:"#475569" }}>
-              {poTarget.ProductName} · {poTarget.Quantity} {poTarget.Unit || ""}
+            <div style={{ background:"#F8FAFC", border:"1px solid #E2E8F0", borderRadius:10, padding:"10px 14px", fontSize:13 }}>
+              <div style={{ fontWeight:600, marginBottom:6 }}>{(poTarget.Items||[]).length} dòng hàng sẽ chuyển vào đơn mua</div>
+              {(poTarget.Items||[]).map(it => (
+                <div key={it.ProductID} style={{ display:"flex", justifyContent:"space-between", color:"#475569", padding:"2px 0" }}>
+                  <span>{it.ProductName}</span>
+                  <span>×{it.Quantity} {it.Unit || ""} · {fmtVnd(it.UnitPrice)}</span>
+                </div>
+              ))}
             </div>
             <div><Label>NHÀ CUNG CẤP</Label>
               <GlassSelect value={poForm.SupplierID} onChange={e=>setPoForm({...poForm,SupplierID:e.target.value})} style={{width:"100%"}}>
@@ -2526,9 +2787,15 @@ const PurchaseRequisitions = () => {
               </GlassSelect>
             </div>
             <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
-              <div><Label>ĐƠN GIÁ (VNĐ)</Label><GlassInput type="number" min={0} value={poForm.UnitPrice||0} onChange={e=>setPoForm({...poForm,UnitPrice:e.target.value})} /></div>
               <div><Label>NGÀY ĐẶT</Label><GlassInput type="date" value={poForm.OrderDate||""} onChange={e=>setPoForm({...poForm,OrderDate:e.target.value})} /></div>
+              <div><Label>KHO NHẬN</Label>
+                <GlassSelect value={poForm.WarehouseID} onChange={e=>setPoForm({...poForm,WarehouseID:e.target.value})} style={{width:"100%"}}>
+                  <option value="">— Không chỉ định —</option>
+                  {warehouses.map(w=><option key={w.WarehouseID} value={w.WarehouseID}>{w.WarehouseID} · {w.WarehouseName}</option>)}
+                </GlassSelect>
+              </div>
             </div>
+            <div style={{ fontSize:12, color:"var(--muted)" }}>Đơn giá lấy theo giá sản phẩm hiện hành; có thể chỉnh sau khi tạo đơn.</div>
             <div style={{ display:"flex", gap:10, marginTop:4 }}>
               <button className="btn-primary" onClick={createPO}>Tạo đơn mua</button>
               <button className="btn-ghost" onClick={()=>setPoTarget(null)}>Hủy</button>
@@ -2541,25 +2808,44 @@ const PurchaseRequisitions = () => {
 };
 
 // ══ RETURNS (V3) ══════════════════════════════════════════════════════════════
-const Returns = () => {
+const Returns = ({ role }) => {
+  const isOrgView = ORG_ROLE_IDS.includes(role);
   const [data, setData] = useState([]);
+  const [warehouses, setWarehouses] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [receiveTarget, setReceiveTarget] = useState(null);
+  const [receiveWarehouse, setReceiveWarehouse] = useState("");
 
   const load = useCallback(() => {
     setLoading(true);
-    apiFetch('/returns')
-      .then(d => { setData(d); setLoading(false); })
+    Promise.all([apiFetch('/returns'), apiFetch('/warehouses')])
+      .then(([d, w]) => { setData(d); setWarehouses(w); setLoading(false); })
       .catch(e => { showToast(e.message || 'Không tải được yêu cầu trả hàng.', 'error'); setLoading(false); });
   }, []);
   useEffect(() => { load(); }, [load]);
 
   const decide = async (r, status) => {
-    if (status === "Approved" && !window.confirm(`Duyệt trả hàng ${r.ReturnID}? Hàng sẽ được cộng lại vào tồn kho.`)) return;
+    if (status === "Approved" && !window.confirm(`Duyệt trả hàng ${r.ReturnID}? Chỉ ghi nhận hoàn tiền — hàng chưa cộng kho cho tới khi nhận hàng trả.`)) return;
     try {
       const res = await apiPatch(`/returns/${r.ReturnID}/status`, { Status: status });
       showToast(status === "Approved" ? `Đã duyệt ${r.ReturnID} · Hoàn tiền ${fmtVnd(res.RefundAmount)}.` : `Đã từ chối ${r.ReturnID}.`);
       load();
     } catch (e) { showToast(e.message || 'Xử lý yêu cầu trả hàng thất bại.', 'error'); }
+  };
+
+  const openReceive = (r) => {
+    setReceiveTarget(r);
+    setReceiveWarehouse(warehouses[0]?.WarehouseID || "");
+  };
+
+  const submitReceive = async () => {
+    try {
+      const res = await apiPost(`/returns/${receiveTarget.ReturnID}/receive`, {
+        WarehouseID: receiveWarehouse || undefined,
+      });
+      showToast(`Đã nhập kho ${receiveTarget.ReturnID} tại ${res.WarehouseID}${res.NewQuantity !== undefined ? ` · tồn mới ${res.NewQuantity}` : ""}.`);
+      setReceiveTarget(null); load();
+    } catch (e) { showToast(e.message || 'Nhận hàng trả thất bại.', 'error'); }
   };
 
   const pendingCount = data.filter(r => r.Status === "Pending").length;
@@ -2590,16 +2876,33 @@ const Returns = () => {
                   <td style={{ padding:"12px 16px" }}>{r.ProductName}</td>
                   <td style={{ padding:"12px 16px", textAlign:"right" }}>{r.Quantity} {r.Unit || ""}</td>
                   <td style={{ padding:"12px 16px", color:"var(--muted)", maxWidth:180, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={r.Reason}>{r.Reason}</td>
-                  <td style={{ padding:"12px 16px", textAlign:"right", fontWeight:600 }}>{r.Status === "Approved" ? fmtVnd(r.RefundAmount) : "—"}</td>
-                  <td style={{ padding:"12px 16px" }}><StatusBadge status={r.Status} /></td>
+                  <td style={{ padding:"12px 16px", textAlign:"right", fontWeight:600 }}>
+                    {["Approved","Received"].includes(r.Status) ? fmtVnd(r.RefundAmount) : "—"}
+                    {r.RefundStatus && r.Status === "Approved" && <div style={{ fontSize:10, color:"#B45309", fontWeight:400 }}>hoàn tiền: chờ chi</div>}
+                    {r.RefundStatus === "Completed" && <div style={{ fontSize:10, color:"#15803D", fontWeight:400 }}>đã hoàn tiền</div>}
+                  </td>
                   <td style={{ padding:"12px 16px" }}>
-                    {r.Status === "Pending" ? (
-                      <div style={{ display:"flex", gap:8 }}>
-                        <button className="btn-primary" onClick={()=>decide(r, "Approved")} style={{ padding:"5px 12px", fontSize:12 }}>Duyệt</button>
-                        <button className="btn-danger" onClick={()=>decide(r, "Rejected")} style={{ padding:"5px 12px", fontSize:12 }}>Từ chối</button>
-                      </div>
+                    <StatusBadge status={r.Status} />
+                    {r.Status === "Received" && <div style={{ fontSize:10, color:"var(--muted)", marginTop:3 }}>đã nhập kho {String(r.ReceivedAt||"").slice(0,10)}</div>}
+                  </td>
+                  <td style={{ padding:"12px 16px" }}>
+                    {isOrgView ? (
+                      <span style={{ color:"var(--muted-2)", fontSize:12 }}>Chỉ xem</span>
                     ) : (
-                      <span style={{ color:"var(--muted-2)", fontSize:12 }}>—</span>
+                      <>
+                        {r.Status === "Pending" && (
+                          <div style={{ display:"flex", gap:8 }}>
+                            <button className="btn-primary" onClick={()=>decide(r, "Approved")} style={{ padding:"5px 12px", fontSize:12 }}>Duyệt</button>
+                            <button className="btn-danger" onClick={()=>decide(r, "Rejected")} style={{ padding:"5px 12px", fontSize:12 }}>Từ chối</button>
+                          </div>
+                        )}
+                        {r.Status === "Approved" && (
+                          <button className="btn-teal" onClick={()=>openReceive(r)} style={{ padding:"5px 12px", fontSize:12 }}>Nhận hàng trả</button>
+                        )}
+                        {["Rejected","Received"].includes(r.Status) && (
+                          <span style={{ color:"var(--muted-2)", fontSize:12 }}>{r.Status === "Received" ? "Hoàn tất" : "—"}</span>
+                        )}
+                      </>
                     )}
                   </td>
                 </tr>
@@ -2607,6 +2910,28 @@ const Returns = () => {
             </tbody>
           </table>
         </GlassCard>
+      )}
+
+      {receiveTarget && (
+        <Modal title={`Nhận hàng trả · ${receiveTarget.ReturnID}`} onClose={()=>setReceiveTarget(null)}>
+          <div style={{ display:"grid", gap:14 }}>
+            <div style={{ background:"#F0FDF4", border:"1px solid #BBF7D0", borderRadius:10, padding:"10px 14px", fontSize:13 }}>
+              <div style={{ fontWeight:600 }}>{receiveTarget.ProductName} × {receiveTarget.Quantity} {receiveTarget.Unit || ""}</div>
+              <div style={{ color:"#475569", marginTop:4 }}>Từ đơn {receiveTarget.OriginalOrderID} · {receiveTarget.CustomerName || receiveTarget.CustomerID}</div>
+              <div style={{ color:"#475569", marginTop:2 }}>Hoàn tiền ghi nhận: {fmtVnd(receiveTarget.RefundAmount)}</div>
+            </div>
+            <div><Label>KHO NHẬN HÀNG TRẢ</Label>
+              <GlassSelect value={receiveWarehouse} onChange={e=>setReceiveWarehouse(e.target.value)} style={{width:"100%"}}>
+                {warehouses.map(w=><option key={w.WarehouseID} value={w.WarehouseID}>{w.WarehouseID} · {w.WarehouseName}</option>)}
+              </GlassSelect>
+            </div>
+            <div style={{ fontSize:12, color:"var(--muted)" }}>Xác nhận sẽ cộng lại tồn kho và ghi sổ kho (CustomerReturn).</div>
+            <div style={{ display:"flex", gap:10, marginTop:4 }}>
+              <button className="btn-primary" onClick={submitReceive}>Xác nhận nhập kho</button>
+              <button className="btn-ghost" onClick={()=>setReceiveTarget(null)}>Hủy</button>
+            </div>
+          </div>
+        </Modal>
       )}
     </div>
   );
@@ -2794,6 +3119,999 @@ const Stocktake = () => {
   );
 };
 
+// ══ ORG DASHBOARD ═════════════════════════════════════════════════════════════
+const OrgDashboard = () => {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    apiFetch('/dashboard/org')
+      .then(d => { setData(d); setLoading(false); })
+      .catch(e => { showToast(e.message || 'Không tải được tổng quan tổ chức.', 'error'); setLoading(false); });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  if (loading) return <Spinner />;
+  if (!data) return <EmptyState icon="🏢" title="Không có dữ liệu tổ chức" sub="Liên hệ quản trị viên để được gán vào tổ chức." />;
+
+  const org = data.organization || {};
+  const T = data.totals || {};
+
+  return (
+    <div className="fade-up">
+      <PageHeader
+        crumb="TỔ CHỨC"
+        title={org.OrganizationName || "Tổng quan tổ chức"}
+        sub={`${org.OrganizationID || ""} · ${org.OrganizationType || ""} · MST ${org.TaxCode || "—"} · ${T.MemberCount || 0} thành viên`}
+        action={<button className="btn-ghost" onClick={load}>↻ Làm mới</button>}
+      />
+
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:16, marginBottom:16 }}>
+        <StatCard label="Đơn đang xử lý" value={T.ActiveOrders || 0} sub="Pending / Accepted / Processing" gradient="#0EA5E9,#22D3EE" icon="🛒" />
+        <StatCard label="Tổng chi tiêu" value={fmtVnd(T.TotalSpend || 0)} sub={`${T.TotalOrders || 0} đơn hợp lệ`} gradient="#10B981,#34D399" icon="💰" />
+        <StatCard label="Yêu cầu mua chờ duyệt" value={T.PendingRequests || 0} sub={`${T.ApprovedRequests || 0} đã duyệt`} gradient="#F59E0B,#FBBF24" icon="🧾" />
+        <StatCard label="Trả hàng chờ xử lý" value={T.PendingReturns || 0} sub="đang chờ duyệt" gradient="#8B5CF6,#A78BFA" icon="↩" />
+      </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16, marginBottom:16 }}>
+        <GlassCard style={{ padding:0, overflow:"hidden" }}>
+          <div style={{ padding:"14px 18px", borderBottom:"1px solid #E5E7EB", fontWeight:600 }}>🧾 Yêu cầu mua gần đây</div>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+            <TableHeader cols={["Mã","Ngày","Giá trị","Trạng thái"]} />
+            <tbody>
+              {(data.recentRequests || []).map(r => (
+                <tr key={r.CPRID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
+                  <td style={{ padding:"10px 16px" }}><IdBadge id={r.CPRID} /></td>
+                  <td style={{ padding:"10px 16px", color:"var(--muted)" }}>{String(r.RequestDate).slice(0,10)}</td>
+                  <td style={{ padding:"10px 16px", textAlign:"right" }}>{fmtVnd(r.TotalEstimated)}</td>
+                  <td style={{ padding:"10px 16px" }}><StatusBadge status={r.Status} /></td>
+                </tr>
+              ))}
+              {(data.recentRequests || []).length === 0 && <tr><td colSpan={4} style={{ padding:16, color:"var(--muted)", textAlign:"center" }}>Chưa có yêu cầu.</td></tr>}
+            </tbody>
+          </table>
+        </GlassCard>
+
+        <GlassCard style={{ padding:0, overflow:"hidden" }}>
+          <div style={{ padding:"14px 18px", borderBottom:"1px solid #E5E7EB", fontWeight:600 }}>🛒 Đơn hàng gần đây</div>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+            <TableHeader cols={["Mã","Ngày","Số tiền","Trạng thái"]} />
+            <tbody>
+              {(data.recentOrders || []).map(o => (
+                <tr key={o.OrderID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
+                  <td style={{ padding:"10px 16px" }}><IdBadge id={o.OrderID} /></td>
+                  <td style={{ padding:"10px 16px", color:"var(--muted)" }}>{String(o.OrderDate).slice(0,10)}</td>
+                  <td style={{ padding:"10px 16px", textAlign:"right" }}>{fmtVnd(o.Bill)}</td>
+                  <td style={{ padding:"10px 16px" }}><StatusBadge status={o.Status} /></td>
+                </tr>
+              ))}
+              {(data.recentOrders || []).length === 0 && <tr><td colSpan={4} style={{ padding:16, color:"var(--muted)", textAlign:"center" }}>Chưa có đơn hàng.</td></tr>}
+            </tbody>
+          </table>
+        </GlassCard>
+      </div>
+
+      <GlassCard style={{ padding:0, overflow:"hidden" }}>
+        <div style={{ padding:"14px 18px", borderBottom:"1px solid #E5E7EB", fontWeight:600 }}>↩ Trả hàng gần đây</div>
+        <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+          <TableHeader cols={["Mã trả","Đơn gốc","Sản phẩm","SL","Hoàn tiền","Trạng thái"]} />
+          <tbody>
+            {(data.recentReturns || []).map(r => (
+              <tr key={r.ReturnID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
+                <td style={{ padding:"10px 16px" }}><IdBadge id={r.ReturnID} /></td>
+                <td style={{ padding:"10px 16px", color:"var(--muted)" }}>{r.OriginalOrderID}</td>
+                <td style={{ padding:"10px 16px" }}>{r.ProductID}</td>
+                <td style={{ padding:"10px 16px", textAlign:"right" }}>{r.Quantity}</td>
+                <td style={{ padding:"10px 16px", textAlign:"right" }}>{r.Status === "Rejected" ? "—" : fmtVnd(r.RefundAmount)}</td>
+                <td style={{ padding:"10px 16px" }}><StatusBadge status={r.Status} /></td>
+              </tr>
+            ))}
+            {(data.recentReturns || []).length === 0 && <tr><td colSpan={6} style={{ padding:16, color:"var(--muted)", textAlign:"center" }}>Chưa có yêu cầu trả hàng.</td></tr>}
+          </tbody>
+        </table>
+      </GlassCard>
+    </div>
+  );
+};
+
+// ══ INVENTORY LEDGER ══════════════════════════════════════════════════════════
+const Ledger = () => {
+  const [data, setData] = useState([]);
+  const [products, setProducts] = useState([]);
+  const [warehouses, setWarehouses] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filters, setFilters] = useState({ product_id: "", warehouse_id: "", transaction_type: "" });
+
+  const load = useCallback(() => {
+    setLoading(true);
+    const qs = Object.entries(filters).filter(([,v]) => v).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join("&");
+    Promise.all([
+      apiFetch(`/inventory/transactions?limit=300${qs ? "&" + qs : ""}`),
+      apiFetch('/products'),
+      apiFetch('/warehouses'),
+    ]).then(([t, p, w]) => { setData(t); setProducts(p); setWarehouses(w); setLoading(false); })
+      .catch(e => { showToast(e.message || 'Không tải được sổ kho.', 'error'); setLoading(false); });
+  }, [filters]);
+  useEffect(() => { load(); }, [load]);
+
+  const inbound = data.filter(t => Number(t.QuantityChange) > 0).reduce((a,t) => a + Number(t.QuantityChange), 0);
+  const outbound = data.filter(t => Number(t.QuantityChange) < 0).reduce((a,t) => a + Math.abs(Number(t.QuantityChange)), 0);
+
+  return (
+    <div className="fade-up">
+      <PageHeader
+        crumb="SỔ KHO"
+        title="Sổ giao dịch kho"
+        sub={`${data.length} giao dịch gần nhất · Nhập +${inbound.toLocaleString('vi-VN')} · Xuất −${outbound.toLocaleString('vi-VN')}`}
+        action={<button className="btn-ghost" onClick={load}>↻ Làm mới</button>}
+      />
+      <GlassCard style={{ marginBottom:16, padding:16 }}>
+        <div style={{ display:"flex", gap:12, alignItems:"flex-end", flexWrap:"wrap" }}>
+          <div style={{ flex:"1 1 200px" }}>
+            <Label>SẢN PHẨM</Label>
+            <GlassSelect value={filters.product_id} onChange={e=>setFilters({...filters, product_id:e.target.value})} style={{width:"100%"}}>
+              <option value="">— Tất cả sản phẩm —</option>
+              {products.map(p=><option key={p.ProductID} value={p.ProductID}>{p.ProductName}</option>)}
+            </GlassSelect>
+          </div>
+          <div style={{ flex:"1 1 180px" }}>
+            <Label>KHO</Label>
+            <GlassSelect value={filters.warehouse_id} onChange={e=>setFilters({...filters, warehouse_id:e.target.value})} style={{width:"100%"}}>
+              <option value="">— Tất cả kho —</option>
+              {warehouses.map(w=><option key={w.WarehouseID} value={w.WarehouseID}>{w.WarehouseName}</option>)}
+            </GlassSelect>
+          </div>
+          <div style={{ flex:"1 1 180px" }}>
+            <Label>LOẠI GIAO DỊCH</Label>
+            <GlassSelect value={filters.transaction_type} onChange={e=>setFilters({...filters, transaction_type:e.target.value})} style={{width:"100%"}}>
+              <option value="">— Tất cả loại —</option>
+              {Object.keys(TXN_VI).map(k=><option key={k} value={k}>{TXN_VI[k]}</option>)}
+            </GlassSelect>
+          </div>
+          {(filters.product_id || filters.warehouse_id || filters.transaction_type) && (
+            <button className="btn-ghost" onClick={()=>setFilters({product_id:"",warehouse_id:"",transaction_type:""})} style={{ padding:"10px 16px", fontSize:13 }}>Xóa lọc</button>
+          )}
+        </div>
+      </GlassCard>
+
+      {loading ? (
+        <GlassCard style={{ padding:0, overflow:'hidden' }}><table style={{ width:'100%', borderCollapse:'collapse' }}><tbody>{[1,2,3].map(i=><SkeletonRow key={i}/>)}</tbody></table></GlassCard>
+      ) : data.length === 0 ? (
+        <GlassCard style={{ padding:0 }}><EmptyState icon="📚" title="Chưa có giao dịch kho" sub="Giao dịch phát sinh khi nhập hàng, bán hàng, trả hàng, kiểm kê." /></GlassCard>
+      ) : (
+        <GlassCard style={{ padding:0, overflow:"hidden" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+            <TableHeader cols={["Thời gian","Loại","Sản phẩm","Kho","Thay đổi","Trước → Sau","Tham chiếu","Người thực hiện"]} />
+            <tbody>
+              {data.map(t => {
+                const change = Number(t.QuantityChange);
+                return (
+                  <tr key={t.TransactionID} className="trow" style={{ borderBottom:"1px solid #F3F4F6" }}>
+                    <td style={{ padding:"10px 16px", color:"var(--muted)", whiteSpace:"nowrap" }}>{String(t.CreatedAt || "").replace("T"," ").slice(0,16)}</td>
+                    <td style={{ padding:"10px 16px" }}>{TXN_VI[t.TransactionType] || t.TransactionType}</td>
+                    <td style={{ padding:"10px 16px", fontWeight:600 }}>{t.ProductName || t.ProductID}</td>
+                    <td style={{ padding:"10px 16px", color:"var(--muted)" }}>{t.WarehouseName || t.WarehouseID}</td>
+                    <td style={{ padding:"10px 16px", textAlign:"right", fontWeight:700, color: change >= 0 ? "#15803D" : "#B91C1C" }}>{change >= 0 ? `+${change}` : change}</td>
+                    <td style={{ padding:"10px 16px", color:"var(--muted)" }}>{t.QuantityBefore} → {t.QuantityAfter}</td>
+                    <td style={{ padding:"10px 16px", color:"var(--muted)" }}>{t.ReferenceID || "—"}</td>
+                    <td style={{ padding:"10px 16px", color:"var(--muted)" }}>{t.PerformedBy || "—"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </GlassCard>
+      )}
+    </div>
+  );
+};
+
+// ══ ORGANIZATIONS (ADMIN) ═════════════════════════════════════════════════════
+const ORG_BLANK = {
+  OrganizationCode: "", OrganizationName: "", TaxCode: "", OrganizationType: "OrganizationCustomer",
+  Address: "", Representative: "", RepresentativePhone: "", RepresentativeEmail: "",
+  Status: "Active", CustomerID: "",
+};
+const OrganizationForm = ({ form, setForm, customers, isEdit }) => (
+  <div style={{ display: "grid", gap: 14 }}>
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+      <div><Label>TÊN DOANH NGHIỆP *</Label><GlassInput value={form.OrganizationName || ""} onChange={e=>setForm({ ...form, OrganizationName: e.target.value })} /></div>
+      <div><Label>MÃ TỔ CHỨC</Label><GlassInput value={form.OrganizationCode || ""} onChange={e=>setForm({ ...form, OrganizationCode: e.target.value })} placeholder="Để trống để tự sinh" /></div>
+    </div>
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+      <div><Label>MÃ SỐ THUẾ</Label><GlassInput value={form.TaxCode || ""} onChange={e=>setForm({ ...form, TaxCode: e.target.value })} /></div>
+      <div><Label>LOẠI TỔ CHỨC</Label>
+        <GlassSelect value={form.OrganizationType || "OrganizationCustomer"} onChange={e=>setForm({ ...form, OrganizationType: e.target.value })} style={{ width: "100%" }}>
+          <option value="OrganizationCustomer">Khách hàng doanh nghiệp</option>
+          <option value="Supplier">Nhà cung cấp</option>
+          <option value="Central">Doanh nghiệp trung tâm</option>
+        </GlassSelect>
+      </div>
+    </div>
+    <div><Label>ĐỊA CHỈ</Label><GlassInput value={form.Address || ""} onChange={e=>setForm({ ...form, Address: e.target.value })} /></div>
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+      <div><Label>NGƯỜI ĐẠI DIỆN</Label><GlassInput value={form.Representative || ""} onChange={e=>setForm({ ...form, Representative: e.target.value })} /></div>
+      <div><Label>ĐIỆN THOẠI</Label><GlassInput value={form.RepresentativePhone || ""} onChange={e=>setForm({ ...form, RepresentativePhone: e.target.value })} /></div>
+      <div><Label>EMAIL</Label><GlassInput value={form.RepresentativeEmail || ""} onChange={e=>setForm({ ...form, RepresentativeEmail: e.target.value })} /></div>
+    </div>
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+      <div><Label>TRẠNG THÁI</Label>
+        <GlassSelect value={form.Status || "Active"} onChange={e=>setForm({ ...form, Status: e.target.value })} style={{ width: "100%" }}>
+          <option value="Active">Hoạt động</option>
+          <option value="Inactive">Ngừng hoạt động</option>
+        </GlassSelect>
+      </div>
+      {!isEdit && (
+        <div><Label>LIÊN KẾT HỒ SƠ KHÁCH HÀNG</Label>
+          <GlassSelect value={form.CustomerID || ""} onChange={e=>setForm({ ...form, CustomerID: e.target.value })} style={{ width: "100%" }}>
+            <option value="">— Chưa liên kết —</option>
+            {customers.filter(c => !c.OrganizationID || c.CustomerID === form.CustomerID)
+              .map(c => <option key={c.CustomerID} value={c.CustomerID}>{c.CustomerID} · {c.CustomerName}</option>)}
+          </GlassSelect>
+        </div>
+      )}
+    </div>
+  </div>
+);
+
+const Organizations = () => {
+  const [data, setData] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [modal, setModal] = useState(null);
+  const [form, setForm] = useState(ORG_BLANK);
+  const [search, setSearch] = useState("");
+
+  const load = useCallback(() => {
+    setLoading(true);
+    Promise.all([apiFetch('/organizations'), apiFetch('/customers')])
+      .then(([o, c]) => { setData(o); setCustomers(c); setLoading(false); })
+      .catch(e => { showToast(e.message || 'Không tải được danh sách tổ chức.', 'error'); setLoading(false); });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const openAdd = () => { setForm(ORG_BLANK); setModal("add"); };
+  const openEdit = (row) => {
+    setForm({ OrganizationCode: row.OrganizationCode || "", OrganizationName: row.OrganizationName || "",
+      TaxCode: row.TaxCode || "", OrganizationType: row.OrganizationType || "OrganizationCustomer",
+      Address: row.Address || "", Representative: row.Representative || "",
+      RepresentativePhone: row.RepresentativePhone || "", RepresentativeEmail: row.RepresentativeEmail || "",
+      Status: row.Status || "Active", CustomerID: row.CustomerID || "", OrganizationID: row.OrganizationID });
+    setModal("edit");
+  };
+
+  const save = async () => {
+    if (!String(form.OrganizationName || "").trim()) { showToast('Nhập tên doanh nghiệp.', 'error'); return; }
+    const payload = { ...form };
+    delete payload.OrganizationID;
+    if (modal === "edit") delete payload.CustomerID;
+    Object.keys(payload).forEach(k => { if (payload[k] === "") delete payload[k]; });
+    try {
+      if (modal === "add") await apiPost('/organizations', payload);
+      else await apiPut(`/organizations/${form.OrganizationID}`, payload);
+      showToast(modal === "add" ? 'Đã tạo tổ chức.' : 'Đã cập nhật tổ chức.');
+      setModal(null); load();
+    } catch (e) { showToast(e.message || 'Lưu tổ chức thất bại.', 'error'); }
+  };
+
+  const keyword = search.trim().toLowerCase();
+  const filtered = data.filter(o => !keyword ||
+    String(o.OrganizationName || "").toLowerCase().includes(keyword) ||
+    String(o.OrganizationID || "").toLowerCase().includes(keyword) ||
+    String(o.TaxCode || "").toLowerCase().includes(keyword));
+
+  return (
+    <div className="fade-up">
+      <PageHeader crumb="TỔ CHỨC" title="Tổ chức khách hàng" sub={`${data.length} pháp nhân kinh doanh`}
+        action={<button className="btn-primary" onClick={openAdd}>+ Thêm tổ chức</button>} />
+      <GlassCard style={{ marginBottom: 16, padding: 16 }}>
+        <GlassInput placeholder="🔍  Tìm theo tên, mã tổ chức hoặc MST..." value={search} onChange={e=>setSearch(e.target.value)} />
+      </GlassCard>
+      {loading ? (
+        <GlassCard style={{ padding: 0, overflow: 'hidden' }}><table style={{ width: '100%', borderCollapse: 'collapse' }}><tbody>{[1,2,3].map(i=><SkeletonRow key={i}/>)}</tbody></table></GlassCard>
+      ) : filtered.length === 0 ? (
+        <GlassCard style={{ padding: 0 }}>
+          <EmptyState icon="🏢" title={search ? 'Không có tổ chức nào khớp' : 'Chưa có tổ chức khách hàng'}
+            sub={search ? 'Thử từ khóa khác.' : 'Tạo pháp nhân khách hàng để bắt đầu nhận yêu cầu mua.'}
+            action={search ? null : openAdd} actionLabel="+ Thêm tổ chức" />
+        </GlassCard>
+      ) : (
+        <GlassCard style={{ padding: 0, overflow: "hidden" }}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <TableHeader cols={["Mã","Doanh nghiệp","MST","Loại","Liên hệ","Thành viên","CPR","Trạng thái","Thao tác"]} />
+              <tbody>
+                {filtered.map(o => (
+                  <tr key={o.OrganizationID} className="trow" style={{ borderBottom: "1px solid #F3F4F6" }}>
+                    <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}><IdBadge id={o.OrganizationID} /></td>
+                    <td style={{ padding: "12px 16px", fontWeight: 600, whiteSpace: "nowrap" }}>{o.OrganizationName}</td>
+                    <td style={{ padding: "12px 16px", color: "var(--muted)", whiteSpace: "nowrap" }}>{o.TaxCode || "—"}</td>
+                    <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}>{o.OrganizationType === "Supplier" ? "Nhà cung cấp" : o.OrganizationType === "Central" ? "Trung tâm" : "Khách hàng"}</td>
+                    <td style={{ padding: "12px 16px", color: "var(--muted)", whiteSpace: "nowrap" }}>{o.Representative || "—"}{o.RepresentativePhone ? ` · ${o.RepresentativePhone}` : ""}</td>
+                    <td style={{ padding: "12px 16px", textAlign: "right" }}>{o.MemberCount || 0}</td>
+                    <td style={{ padding: "12px 16px", textAlign: "right" }}>{o.CPRCount || 0}</td>
+                    <td style={{ padding: "12px 16px" }}><StatusBadge status={o.Status} /></td>
+                    <td style={{ padding: "12px 16px" }}>
+                      <button className="btn-ghost" onClick={()=>openEdit(o)} style={{ fontSize: 12, padding: "5px 12px" }}>Sửa</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </GlassCard>
+      )}
+      {modal && (
+        <Modal title={modal === "add" ? "Thêm tổ chức khách hàng" : `Sửa tổ chức · ${form.OrganizationID}`} onClose={()=>setModal(null)}>
+          <OrganizationForm form={form} setForm={setForm} customers={customers} isEdit={modal === "edit"} />
+          <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+            <button className="btn-primary" onClick={save}>Lưu tổ chức</button>
+            <button className="btn-ghost" onClick={()=>setModal(null)}>Hủy</button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+};
+
+// ══ CUSTOMER PURCHASE REQUESTS (ADMIN REVIEW → SALES ORDER) ═══════════════════
+const CustomerRequests = () => {
+  const [data, setData] = useState([]);
+  const [warehouses, setWarehouses] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [status, setStatus] = useState("");
+  const [search, setSearch] = useState("");
+  const [detail, setDetail] = useState(null);
+  const [prOpen, setPrOpen] = useState(false);
+  const [prWarehouse, setPrWarehouse] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    Promise.all([apiFetch('/customer-purchase-requests'), apiFetch('/warehouses')])
+      .then(([d, w]) => { setData(d); setWarehouses(w); setLoading(false); })
+      .catch(e => { showToast(e.message || 'Không tải được yêu cầu mua của khách hàng.', 'error'); setLoading(false); });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const openDetail = async (row) => {
+    try {
+      const [full] = await Promise.all([apiFetch(`/customer-purchase-requests/${row.CPRID}`)]);
+      setDetail(full);
+      setPrWarehouse(warehouses[0]?.WarehouseID || "");
+    } catch (e) { showToast(e.message || 'Không tải được chi tiết yêu cầu.', 'error'); }
+  };
+
+  const decide = async (row, next, reason) => {
+    setBusy(true);
+    try {
+      await apiPatch(`/customer-purchase-requests/${row.CPRID}/status`, { Status: next, ...(reason ? { RejectReason: reason } : {}) });
+      showToast(next === 'Approved' ? `Đã duyệt ${row.CPRID}.` : `Đã từ chối ${row.CPRID}.`);
+      setDetail(d => (d && d.CPRID === row.CPRID ? { ...d, Status: next } : d));
+      load();
+    } catch (e) { showToast(e.message || 'Cập nhật yêu cầu thất bại.', 'error'); }
+    setBusy(false);
+  };
+
+  const convert = async (row) => {
+    if (!window.confirm(`Chuyển ${row.CPRID} thành đơn bán (Sales Order)? Hệ thống kiểm tra tồn kho khi duyệt đơn.`)) return;
+    setBusy(true);
+    try {
+      const res = await apiPost(`/customer-purchase-requests/${row.CPRID}/convert`);
+      showToast(`Đã tạo ${res.OrderIDs?.length || 0} đơn bán từ ${row.CPRID}.`);
+      setDetail(null); load();
+    } catch (e) { showToast(e.message || 'Chuyển yêu cầu thất bại.', 'error'); }
+    setBusy(false);
+  };
+
+  const createReplenishPR = async () => {
+    if (!detail) return;
+    const items = (detail.Items || []).map(i => ({ ProductID: i.ProductID, Quantity: Number(i.Quantity) }));
+    if (items.length === 0) { showToast('Yêu cầu không có dòng hàng.', 'error'); return; }
+    setBusy(true);
+    try {
+      const res = await apiPost('/purchase-requisitions', {
+        Items: items,
+        Reason: `Bổ sung tồn kho cho ${detail.CPRID} (${detail.OrganizationName || detail.OrganizationID})`,
+        WarehouseID: prWarehouse || undefined,
+      });
+      showToast(`Đã tạo yêu cầu mua nội bộ ${res.PRID} để bổ sung tồn kho.`);
+      setPrOpen(false);
+    } catch (e) { showToast(e.message || 'Tạo yêu cầu mua nội bộ thất bại.', 'error'); }
+    setBusy(false);
+  };
+
+  const keyword = search.trim().toLowerCase();
+  const filtered = data.filter(r =>
+    (!status || r.Status === status) &&
+    (!keyword || [r.CPRID, r.OrganizationName, r.RequestedByName].some(v => String(v || "").toLowerCase().includes(keyword)))
+  );
+  const pending = data.filter(r => r.Status === "Submitted").length;
+  const cols = ["Mã CPR","Ngày","Doanh nghiệp","Người tạo","Dòng hàng","Giá trị dự kiến","Trạng thái","Thao tác"];
+
+  return (
+    <div className="fade-up">
+      <PageHeader crumb="BÁN HÀNG" title="Yêu cầu mua của khách hàng"
+        sub={`${data.length} yêu cầu · ${pending} chờ xử lý`}
+        action={<button className="btn-ghost" onClick={load}>↻ Làm mới</button>} />
+      <GlassCard style={{ marginBottom: 16, padding: 16 }}>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 260px" }}>
+            <GlassInput placeholder="🔍  Tìm mã yêu cầu, doanh nghiệp, người tạo..." value={search} onChange={e=>setSearch(e.target.value)} />
+          </div>
+          <div style={{ flex: "0 0 200px" }}>
+            <GlassSelect value={status} onChange={e=>setStatus(e.target.value)} style={{ width: "100%" }}>
+              <option value="">— Tất cả trạng thái —</option>
+              {["Submitted","Approved","Rejected","Converted","Cancelled"].map(s => <option key={s} value={s}>{STATUS_VI[s] || s}</option>)}
+            </GlassSelect>
+          </div>
+        </div>
+      </GlassCard>
+      {loading ? (
+        <GlassCard style={{ padding: 0, overflow: 'hidden' }}><table style={{ width: '100%', borderCollapse: 'collapse' }}><tbody>{[1,2,3].map(i=><SkeletonRow key={i}/>)}</tbody></table></GlassCard>
+      ) : filtered.length === 0 ? (
+        <GlassCard style={{ padding: 0 }}>
+          <EmptyState icon="🧾" title="Chưa có yêu cầu mua" sub="Yêu cầu do khách hàng doanh nghiệp gửi từ cổng B2B sẽ xuất hiện tại đây." />
+        </GlassCard>
+      ) : (
+        <GlassCard style={{ padding: 0, overflow: "hidden" }}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <TableHeader cols={cols} />
+              <tbody>
+                {filtered.map(r => (
+                  <tr key={r.CPRID} className="trow" style={{ borderBottom: "1px solid #F3F4F6" }}>
+                    <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}><IdBadge id={r.CPRID} /></td>
+                    <td style={{ padding: "12px 16px", color: "var(--muted)", whiteSpace: "nowrap" }}>{String(r.CreatedAt || "").slice(0, 10)}</td>
+                    <td style={{ padding: "12px 16px", fontWeight: 600, whiteSpace: "nowrap" }}>{r.OrganizationName}</td>
+                    <td style={{ padding: "12px 16px", color: "var(--muted)", whiteSpace: "nowrap" }}>{r.RequestedByName || "—"}</td>
+                    <td style={{ padding: "12px 16px", textAlign: "right" }}>{r.ItemCount || 0}</td>
+                    <td style={{ padding: "12px 16px", textAlign: "right", fontWeight: 600, whiteSpace: "nowrap" }}>{fmtVnd(r.TotalEstimated)}</td>
+                    <td style={{ padding: "12px 16px" }}><StatusBadge status={r.Status} /></td>
+                    <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}>
+                      <button className="btn-ghost" onClick={()=>openDetail(r)} style={{ fontSize: 12, padding: "5px 12px" }}>Xem</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </GlassCard>
+      )}
+      {detail && (
+        <Modal title={`Yêu cầu mua · ${detail.CPRID}`} onClose={()=>setDetail(null)} wide>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
+            <div style={{ background: "#F9FAFB", border: "1px solid #E5E7EB", borderRadius: 10, padding: "14px 16px" }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>{detail.OrganizationName}</div>
+              <div style={{ fontSize: 12, color: "var(--muted)" }}>Mã KH: {detail.CustomerID} · {detail.CustomerName || ""}</div>
+              <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>Người tạo: {detail.RequestedByName}</div>
+              <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>Ngày tạo: {String(detail.CreatedAt || "").slice(0, 16).replace("T", " ")}</div>
+            </div>
+            <div style={{ background: "#F9FAFB", border: "1px solid #E5E7EB", borderRadius: 10, padding: "14px 16px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}><span>Trạng thái</span><StatusBadge status={detail.Status} /></div>
+              <div style={{ fontSize: 12, color: "var(--muted)" }}>Giá trị dự kiến: <b style={{ color: "#1F2937" }}>{fmtVnd(detail.TotalEstimated)}</b></div>
+              {detail.Note && <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>Ghi chú: {detail.Note}</div>}
+              {detail.RejectReason && <div style={{ fontSize: 12, color: "#B91C1C", marginTop: 4 }}>Lý do từ chối: {detail.RejectReason}</div>}
+            </div>
+          </div>
+          <div style={{ overflowX: "auto", border: "1px solid #E5E7EB", borderRadius: 10, marginBottom: 16 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <TableHeader cols={["Dòng","Mã hàng","Sản phẩm","ĐVT","Số lượng","Đơn giá","Thành tiền"]} />
+              <tbody>
+                {(detail.Items || []).map(i => (
+                  <tr key={i.LineNo} style={{ borderBottom: "1px solid #F3F4F6" }}>
+                    <td style={{ padding: "10px 16px", color: "var(--muted)" }}>{i.LineNo}</td>
+                    <td style={{ padding: "10px 16px", whiteSpace: "nowrap" }}><IdBadge id={i.ProductID} /></td>
+                    <td style={{ padding: "10px 16px", fontWeight: 600 }}>{i.ProductName}</td>
+                    <td style={{ padding: "10px 16px", whiteSpace: "nowrap" }}>{i.Unit || unitVi(i)}</td>
+                    <td style={{ padding: "10px 16px", textAlign: "right" }}>{i.Quantity}</td>
+                    <td style={{ padding: "10px 16px", textAlign: "right", whiteSpace: "nowrap" }}>{fmtVnd(i.UnitPrice)}</td>
+                    <td style={{ padding: "10px 16px", textAlign: "right", fontWeight: 600, whiteSpace: "nowrap" }}>{fmtVnd(Number(i.UnitPrice) * Number(i.Quantity))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {!prOpen ? (
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              {detail.Status === "Submitted" && (
+                <>
+                  <button className="btn-primary" disabled={busy} onClick={()=>decide(detail, "Approved")}>Duyệt yêu cầu</button>
+                  <button className="btn-danger" disabled={busy} onClick={()=>{ const reason = window.prompt("Lý do từ chối:"); if (reason && reason.trim()) decide(detail, "Rejected", reason.trim()); }}>Từ chối</button>
+                </>
+              )}
+              {detail.Status === "Approved" && (
+                <button className="btn-primary" disabled={busy} onClick={()=>convert(detail)}>Chuyển thành đơn bán</button>
+              )}
+              {detail.Status === "Submitted" && (
+                <button className="btn-ghost" onClick={()=>setPrOpen(true)}>Tạo yêu cầu mua nội bộ</button>
+              )}
+              {detail.Status === "Converted" && <span style={{ fontSize: 13, color: "var(--muted)" }}>Đã chuyển thành đơn bán: {(detail.ConvertedOrders || []).map(o => o.OrderID).join(", ") || "—"}</span>}
+            </div>
+          ) : (
+            <div style={{ background: "#F9FAFB", border: "1px solid #E5E7EB", borderRadius: 10, padding: 16 }}>
+              <div style={{ fontSize: 13, marginBottom: 10 }}>Tạo phiếu yêu cầu mua (PR) để bổ sung đúng các mặt hàng còn thiếu của yêu cầu này.</div>
+              <div style={{ marginBottom: 12 }}><Label>KHO NHẬN HÀNG</Label>
+                <GlassSelect value={prWarehouse} onChange={e=>setPrWarehouse(e.target.value)} style={{ width: "100%" }}>
+                  {warehouses.map(w => <option key={w.WarehouseID} value={w.WarehouseID}>{w.WarehouseID} · {w.WarehouseName}</option>)}
+                </GlassSelect>
+              </div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <button className="btn-primary" disabled={busy} onClick={createReplenishPR}>Tạo PR</button>
+                <button className="btn-ghost" onClick={()=>setPrOpen(false)}>Hủy</button>
+              </div>
+            </div>
+          )}
+          <div style={{ marginTop: 16 }}><button className="btn-ghost" onClick={()=>setDetail(null)}>Đóng</button></div>
+        </Modal>
+      )}
+    </div>
+  );
+};
+
+// ══ ORGANIZATION PROFILE (B2B PORTAL) ══════════════════════════════════════════
+const OrgProfile = ({ role }) => {
+  const canEdit = role === "org_manager";
+  const [org, setOrg] = useState(null);
+  const [members, setMembers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({});
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    Promise.all([apiFetch('/organizations/me'), apiFetch('/organizations/members')])
+      .then(([o, m]) => {
+        setOrg(o); setMembers(m);
+        setForm({ Address: o.Address || "", Representative: o.Representative || "",
+          RepresentativePhone: o.RepresentativePhone || "", RepresentativeEmail: o.RepresentativeEmail || "" });
+        setLoading(false);
+      })
+      .catch(e => { showToast(e.message || 'Không tải được hồ sơ doanh nghiệp.', 'error'); setLoading(false); });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await apiPut(`/organizations/${org.OrganizationID}`, form);
+      showToast('Đã cập nhật hồ sơ doanh nghiệp.');
+      setEditing(false); load();
+    } catch (e) { showToast(e.message || 'Cập nhật hồ sơ thất bại.', 'error'); }
+    setSaving(false);
+  };
+
+  if (loading) return <Spinner />;
+  if (!org) return <EmptyState icon="🏢" title="Không có hồ sơ doanh nghiệp" sub="Liên hệ quản trị viên để được gán vào tổ chức." />;
+
+  return (
+    <div className="fade-up">
+      <PageHeader crumb="HỒ SƠ DOANH NGHIỆP" title={org.OrganizationName}
+        sub={`${org.OrganizationID} · ${org.OrganizationCode || ""} · MST ${org.TaxCode || "—"} · Mã KH ${org.CustomerID || "—"}`}
+        action={canEdit ? <button className="btn-primary" onClick={()=>setEditing(true)}>Sửa hồ sơ</button> : null} />
+      <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 16, marginBottom: 16 }}>
+        <GlassCard style={{ padding: 22 }}>
+          <div style={{ fontWeight: 600, marginBottom: 16 }}>Thông tin pháp lý</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+            <ProfileRow label="TÊN DOANH NGHIỆP" value={org.OrganizationName} />
+            <ProfileRow label="MÃ SỐ THUẾ" value={org.TaxCode} />
+            <ProfileRow label="MÃ TỔ CHỨC" value={org.OrganizationCode || org.OrganizationID} />
+            <ProfileRow label="MÃ KHÁCH HÀNG" value={org.CustomerID} />
+            <ProfileRow label="NGƯỜI ĐẠI DIỆN" value={org.Representative} />
+            <ProfileRow label="ĐIỆN THOẠI" value={org.RepresentativePhone} />
+            <ProfileRow label="EMAIL" value={org.RepresentativeEmail} />
+            <ProfileRow label="TRẠNG THÁI" value={org.Status === "Inactive" ? "Ngừng hoạt động" : "Hoạt động"} />
+            <div style={{ gridColumn: "1 / -1" }}><ProfileRow label="ĐỊA CHỈ" value={org.Address} /></div>
+          </div>
+        </GlassCard>
+        <GlassCard style={{ padding: 22 }}>
+          <div style={{ fontWeight: 600, marginBottom: 16 }}>Thành viên ({members.length})</div>
+          {members.map(m => (
+            <div key={m.Username} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: "1px solid #F3F4F6" }}>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>{m.FullName || m.Username}</div>
+                <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{m.Position || ROLE_VI[m.Role] || m.Role} · {m.Username}</div>
+              </div>
+              <StatusBadge status={m.Status === "Inactive" ? "Inactive" : "Active"} />
+            </div>
+          ))}
+          {members.length === 0 && <div style={{ fontSize: 13, color: "var(--muted)" }}>Chưa có thành viên.</div>}
+        </GlassCard>
+      </div>
+      {editing && (
+        <Modal title="Sửa hồ sơ doanh nghiệp" onClose={()=>setEditing(false)}>
+          <div style={{ display: "grid", gap: 14 }}>
+            <div style={{ fontSize: 12, color: "var(--muted)" }}>Chỉ các trường liên hệ được sửa. Tên doanh nghiệp và mã số thuế do quản trị viên hệ thống quản lý.</div>
+            <div><Label>ĐỊA CHỈ</Label><GlassInput value={form.Address || ""} onChange={e=>setForm({ ...form, Address: e.target.value })} /></div>
+            <div><Label>NGƯỜI ĐẠI DIỆN</Label><GlassInput value={form.Representative || ""} onChange={e=>setForm({ ...form, Representative: e.target.value })} /></div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <div><Label>ĐIỆN THOẠI</Label><GlassInput value={form.RepresentativePhone || ""} onChange={e=>setForm({ ...form, RepresentativePhone: e.target.value })} /></div>
+              <div><Label>EMAIL</Label><GlassInput value={form.RepresentativeEmail || ""} onChange={e=>setForm({ ...form, RepresentativeEmail: e.target.value })} /></div>
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button className="btn-primary" onClick={save} disabled={saving}>{saving ? "Đang lưu..." : "Lưu thay đổi"}</button>
+              <button className="btn-ghost" onClick={()=>setEditing(false)}>Hủy</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+};
+
+// ══ ORGANIZATION MEMBERS (B2B PORTAL · MANAGER) ════════════════════════════════
+const OrgMembers = ({ role }) => {
+  const canManage = role === "org_manager";
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [modal, setModal] = useState(null);
+  const [form, setForm] = useState({});
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    apiFetch('/organizations/members')
+      .then(d => { setData(d); setLoading(false); })
+      .catch(e => { showToast(e.message || 'Không tải được danh sách thành viên.', 'error'); setLoading(false); });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      if (modal === "add") {
+        await apiPost('/organizations/members', form);
+        showToast('Đã thêm thành viên vào tổ chức.');
+      } else {
+        const payload = { FullName: form.FullName, Position: form.Position, Email: form.Email, Status: form.Status };
+        if (form.Password) payload.Password = form.Password;
+        await apiPut(`/organizations/members/${form.Username}`, payload);
+        showToast('Đã cập nhật thành viên.');
+      }
+      setModal(null); load();
+    } catch (e) { showToast(e.message || 'Lưu thành viên thất bại.', 'error'); }
+    setSaving(false);
+  };
+
+  return (
+    <div className="fade-up">
+      <PageHeader crumb="THÀNH VIÊN" title="Quản lý thành viên doanh nghiệp"
+        sub={`${data.length} tài khoản thuộc tổ chức`}
+        action={canManage ? <button className="btn-primary" onClick={()=>{ setForm({ Username: "", Password: "", FullName: "", Position: "", Email: "" }); setModal("add"); }}>+ Thêm thành viên</button> : null} />
+      {loading ? (
+        <GlassCard style={{ padding: 0, overflow: 'hidden' }}><table style={{ width: '100%', borderCollapse: 'collapse' }}><tbody>{[1,2,3].map(i=><SkeletonRow key={i}/>)}</tbody></table></GlassCard>
+      ) : data.length === 0 ? (
+        <GlassCard style={{ padding: 0 }}><EmptyState icon="👥" title="Chưa có thành viên" sub="Thêm tài khoản nhân viên mua hàng cho doanh nghiệp." /></GlassCard>
+      ) : (
+        <GlassCard style={{ padding: 0, overflow: "hidden" }}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <TableHeader cols={["Tên đăng nhập","Họ tên","Chức vụ","Vai trò","Email","Trạng thái","Thao tác"]} />
+              <tbody>
+                {data.map(m => (
+                  <tr key={m.Username} className="trow" style={{ borderBottom: "1px solid #F3F4F6" }}>
+                    <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}><IdBadge id={m.Username} /></td>
+                    <td style={{ padding: "12px 16px", fontWeight: 600, whiteSpace: "nowrap" }}>{m.FullName || "—"}</td>
+                    <td style={{ padding: "12px 16px", color: "var(--muted)", whiteSpace: "nowrap" }}>{m.Position || "—"}</td>
+                    <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}>{ROLE_VI[m.Role] || m.Role}</td>
+                    <td style={{ padding: "12px 16px", color: "var(--muted)", whiteSpace: "nowrap" }}>{m.Email || "—"}</td>
+                    <td style={{ padding: "12px 16px" }}><StatusBadge status={m.Status === "Inactive" ? "Inactive" : "Active"} /></td>
+                    <td style={{ padding: "12px 16px" }}>
+                      {canManage && m.Role !== "admin" ? (
+                        <button className="btn-ghost" style={{ fontSize: 12, padding: "5px 12px" }}
+                          onClick={()=>{ setForm({ Username: m.Username, FullName: m.FullName || "", Position: m.Position || "", Email: m.Email || "", Status: m.Status || "Active", Password: "" }); setModal("edit"); }}>Sửa</button>
+                      ) : <span style={{ color: "var(--muted-2)", fontSize: 12 }}>Chỉ xem</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </GlassCard>
+      )}
+      {modal && (
+        <Modal title={modal === "add" ? "Thêm thành viên" : `Sửa thành viên · ${form.Username}`} onClose={()=>setModal(null)}>
+          <div style={{ display: "grid", gap: 14 }}>
+            {modal === "add" && (
+              <div><Label>TÊN ĐĂNG NHẬP *</Label><GlassInput value={form.Username || ""} onChange={e=>setForm({ ...form, Username: e.target.value })} placeholder="vd: chi.le" /></div>
+            )}
+            <div><Label>HỌ TÊN *</Label><GlassInput value={form.FullName || ""} onChange={e=>setForm({ ...form, FullName: e.target.value })} /></div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <div><Label>CHỨC VỤ</Label><GlassInput value={form.Position || ""} onChange={e=>setForm({ ...form, Position: e.target.value })} /></div>
+              <div><Label>EMAIL</Label><GlassInput value={form.Email || ""} onChange={e=>setForm({ ...form, Email: e.target.value })} /></div>
+            </div>
+            <div><Label>{modal === "add" ? "MẬT KHẨU * (tối thiểu 8 ký tự)" : "MẬT KHẨU MỚI (để trống nếu giữ nguyên)"}</Label>
+              <GlassInput type="password" value={form.Password || ""} onChange={e=>setForm({ ...form, Password: e.target.value })} /></div>
+            {modal === "edit" && (
+              <div><Label>TRẠNG THÁI</Label>
+                <GlassSelect value={form.Status || "Active"} onChange={e=>setForm({ ...form, Status: e.target.value })} style={{ width: "100%" }}>
+                  <option value="Active">Hoạt động</option>
+                  <option value="Inactive">Ngừng hoạt động</option>
+                </GlassSelect>
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 10 }}>
+              <button className="btn-primary" onClick={save} disabled={saving}>{saving ? "Đang lưu..." : "Lưu"}</button>
+              <button className="btn-ghost" onClick={()=>setModal(null)}>Hủy</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+};
+
+// ══ PRODUCT CATALOG (B2B PORTAL) ═══════════════════════════════════════════════
+const OrgCatalog = () => {
+  const [products, setProducts] = useState([]);
+  const [suppliers, setSuppliers] = useState([]);
+  const [stock, setStock] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const [category, setCategory] = useState("");
+  const [cart, setCart] = useState({});
+  const [note, setNote] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    Promise.all([apiFetch('/products'), apiFetch('/suppliers'), apiFetch('/inventory')])
+      .then(([p, s, inv]) => {
+        const byProduct = {};
+        inv.forEach(i => { byProduct[i.ProductID] = (byProduct[i.ProductID] || 0) + Number(i.QuantityAvailable || 0); });
+        setProducts(p); setSuppliers(s); setStock(byProduct); setLoading(false);
+      })
+      .catch(e => { showToast(e.message || 'Không tải được danh mục sản phẩm.', 'error'); setLoading(false); });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const setQty = (productId, value) => {
+    const qty = Math.max(0, Math.min(99999, parseInt(value, 10) || 0));
+    setCart(prev => {
+      const next = { ...prev };
+      if (qty > 0) next[productId] = qty; else delete next[productId];
+      return next;
+    });
+  };
+
+  const lines = Object.entries(cart).map(([ProductID, Quantity]) => {
+    const product = products.find(p => p.ProductID === ProductID) || {};
+    return { ProductID, Quantity, ProductName: product.ProductName, UnitPrice: Number(product.UnitPrice || 0) };
+  });
+  const total = lines.reduce((a, l) => a + l.UnitPrice * l.Quantity, 0);
+  const supplierName = (id) => suppliers.find(s => s.SupplierID === id)?.SupplierName || id || "—";
+
+  const submit = async () => {
+    if (lines.length === 0) { showToast('Chọn ít nhất một sản phẩm và số lượng.', 'error'); return; }
+    setSubmitting(true);
+    try {
+      const res = await apiPost('/customer-purchase-requests', {
+        Items: lines.map(l => ({ ProductID: l.ProductID, Quantity: l.Quantity })),
+        Note: note || undefined,
+      });
+      showToast(`Đã gửi yêu cầu ${res.CPRID} · ${res.ItemCount} dòng hàng · ${fmtVnd(res.TotalEstimated)}.`);
+      setCart({}); setNote("");
+    } catch (e) { showToast(e.message || 'Gửi yêu cầu mua hàng thất bại.', 'error'); }
+    setSubmitting(false);
+  };
+
+  const keyword = search.trim().toLowerCase();
+  const filtered = products.filter(p =>
+    (!category || catVi(p.Category) === category) &&
+    (!keyword || String(p.ProductName || "").toLowerCase().includes(keyword) || String(p.ProductID || "").toLowerCase().includes(keyword))
+  );
+
+  return (
+    <div className="fade-up">
+      <PageHeader crumb="DANH MỤC SẢN PHẨM" title="Danh mục hàng hóa B2B"
+        sub={`${products.length} mặt hàng · Giá bán doanh nghiệp đã bao gồm chính sách B2B`}
+        action={<button className="btn-ghost" onClick={load}>↻ Làm mới</button>} />
+      <GlassCard style={{ marginBottom: 16, padding: 16 }}>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 280px" }}>
+            <GlassInput placeholder="🔍  Tìm theo mã hàng hoặc tên sản phẩm..." value={search} onChange={e=>setSearch(e.target.value)} />
+          </div>
+          <div style={{ flex: "0 0 200px" }}>
+            <GlassSelect value={category} onChange={e=>setCategory(e.target.value)} style={{ width: "100%" }}>
+              <option value="">— Tất cả danh mục —</option>
+              {CATS.map(c => <option key={c} value={c}>{c}</option>)}
+            </GlassSelect>
+          </div>
+        </div>
+      </GlassCard>
+      {loading ? (
+        <GlassCard style={{ padding: 0, overflow: 'hidden' }}><table style={{ width: '100%', borderCollapse: 'collapse' }}><tbody>{[1,2,3].map(i=><SkeletonRow key={i}/>)}</tbody></table></GlassCard>
+      ) : filtered.length === 0 ? (
+        <GlassCard style={{ padding: 0 }}><EmptyState icon="📦" title="Không có sản phẩm phù hợp" sub="Thử từ khóa hoặc danh mục khác." /></GlassCard>
+      ) : (
+        <GlassCard style={{ padding: 0, overflow: "hidden" }}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <TableHeader cols={["Mã hàng","Tên sản phẩm","Danh mục","ĐVT","Nhà cung cấp","Giá B2B","Tồn khả dụng","Số lượng yêu cầu"]} />
+              <tbody>
+                {filtered.map(p => (
+                  <tr key={p.ProductID} className="trow" style={{ borderBottom: "1px solid #F3F4F6" }}>
+                    <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}><IdBadge id={p.ProductID} /></td>
+                    <td style={{ padding: "12px 16px", fontWeight: 600 }}>{p.ProductName}</td>
+                    <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}>{catVi(p.Category)}</td>
+                    <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}>{unitVi(p)}</td>
+                    <td style={{ padding: "12px 16px", color: "var(--muted)", whiteSpace: "nowrap" }}>{supplierName(p.SupplierID)}</td>
+                    <td style={{ padding: "12px 16px", textAlign: "right", fontWeight: 600, whiteSpace: "nowrap" }}>{fmtVnd(p.UnitPrice)}</td>
+                    <td style={{ padding: "12px 16px", textAlign: "right", whiteSpace: "nowrap" }}>{(stock[p.ProductID] || 0).toLocaleString("vi-VN")}</td>
+                    <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}>
+                      <input className="glass-input" type="number" min="0" style={{ width: 90, padding: "6px 10px" }}
+                        value={cart[p.ProductID] ?? ""} placeholder="0"
+                        onChange={e=>setQty(p.ProductID, e.target.value)} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </GlassCard>
+      )}
+
+      <GlassCard style={{ marginTop: 16, padding: 20 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 10 }}>
+          <div style={{ fontFamily: "var(--font-head)", fontWeight: 600, fontSize: 15 }}>Danh sách yêu cầu mua ({lines.length} dòng)</div>
+          <div style={{ fontSize: 14 }}>Tổng giá trị dự kiến: <b style={{ color: "#DA251D", fontSize: 17 }}>{fmtVnd(total)}</b></div>
+        </div>
+        {lines.length === 0 ? (
+          <div style={{ fontSize: 13, color: "var(--muted)", padding: "10px 0" }}>Chưa chọn sản phẩm. Nhập số lượng ở bảng trên để thêm vào yêu cầu.</div>
+        ) : (
+          <div style={{ overflowX: "auto", marginBottom: 12 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <TableHeader cols={["Mã hàng","Sản phẩm","Số lượng","Đơn giá","Thành tiền",""]} />
+              <tbody>
+                {lines.map(l => (
+                  <tr key={l.ProductID} style={{ borderBottom: "1px solid #F3F4F6" }}>
+                    <td style={{ padding: "10px 16px", whiteSpace: "nowrap" }}>{l.ProductID}</td>
+                    <td style={{ padding: "10px 16px", fontWeight: 600 }}>{l.ProductName}</td>
+                    <td style={{ padding: "10px 16px", textAlign: "right" }}>{l.Quantity}</td>
+                    <td style={{ padding: "10px 16px", textAlign: "right", whiteSpace: "nowrap" }}>{fmtVnd(l.UnitPrice)}</td>
+                    <td style={{ padding: "10px 16px", textAlign: "right", fontWeight: 600, whiteSpace: "nowrap" }}>{fmtVnd(l.UnitPrice * l.Quantity)}</td>
+                    <td style={{ padding: "10px 16px" }}><button className="btn-danger" style={{ fontSize: 11, padding: "3px 10px" }} onClick={()=>setQty(l.ProductID, 0)}>Bỏ</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <div style={{ display: "grid", gap: 12, marginTop: 8 }}>
+          <div><Label>GHI CHÚ CHO YÊU CẦU</Label><GlassInput value={note} onChange={e=>setNote(e.target.value)} placeholder="Thời hạn giao hàng, địa điểm nhận, yêu cầu chứng từ..." /></div>
+          <div><button className="btn-primary" onClick={submit} disabled={submitting || lines.length === 0}>{submitting ? "Đang gửi..." : "Gửi yêu cầu mua hàng"}</button></div>
+        </div>
+      </GlassCard>
+    </div>
+  );
+};
+
+// ══ CUSTOMER PURCHASE REQUESTS (B2B PORTAL) ════════════════════════════════════
+const OrgRequests = ({ role }) => {
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [status, setStatus] = useState("");
+  const [detail, setDetail] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    apiFetch('/customer-purchase-requests')
+      .then(d => { setData(d); setLoading(false); })
+      .catch(e => { showToast(e.message || 'Không tải được yêu cầu mua hàng.', 'error'); setLoading(false); });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const openDetail = async (row) => {
+    try { setDetail(await apiFetch(`/customer-purchase-requests/${row.CPRID}`)); }
+    catch (e) { showToast(e.message || 'Không tải được chi tiết yêu cầu.', 'error'); }
+  };
+
+  const cancel = async (row) => {
+    if (!window.confirm(`Hủy yêu cầu ${row.CPRID}?`)) return;
+    setBusy(true);
+    try {
+      await apiPatch(`/customer-purchase-requests/${row.CPRID}/status`, { Status: "Cancelled" });
+      showToast(`Đã hủy ${row.CPRID}.`);
+      setDetail(null); load();
+    } catch (e) { showToast(e.message || 'Hủy yêu cầu thất bại.', 'error'); }
+    setBusy(false);
+  };
+
+  const filtered = data.filter(r => !status || r.Status === status);
+  const value = data.filter(r => !["Rejected","Cancelled"].includes(r.Status)).reduce((a, r) => a + Number(r.TotalEstimated || 0), 0);
+
+  return (
+    <div className="fade-up">
+      <PageHeader crumb="YÊU CẦU MUA HÀNG" title="Yêu cầu mua hàng của doanh nghiệp"
+        sub={`${data.length} yêu cầu · Tổng giá trị dự kiến ${fmtVnd(value)}`}
+        action={<button className="btn-ghost" onClick={load}>↻ Làm mới</button>} />
+      <GlassCard style={{ marginBottom: 16, padding: 16 }}>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 240px", fontSize: 13, color: "var(--muted)", alignSelf: "center" }}>
+            Tạo yêu cầu mới tại mục <b>Danh mục sản phẩm</b>.
+          </div>
+          <div style={{ flex: "0 0 200px" }}>
+            <GlassSelect value={status} onChange={e=>setStatus(e.target.value)} style={{ width: "100%" }}>
+              <option value="">— Tất cả trạng thái —</option>
+              {["Submitted","Approved","Rejected","Converted","Cancelled"].map(s => <option key={s} value={s}>{STATUS_VI[s] || s}</option>)}
+            </GlassSelect>
+          </div>
+        </div>
+      </GlassCard>
+      {loading ? (
+        <GlassCard style={{ padding: 0, overflow: 'hidden' }}><table style={{ width: '100%', borderCollapse: 'collapse' }}><tbody>{[1,2,3].map(i=><SkeletonRow key={i}/>)}</tbody></table></GlassCard>
+      ) : filtered.length === 0 ? (
+        <GlassCard style={{ padding: 0 }}><EmptyState icon="🧾" title="Chưa có yêu cầu mua hàng" sub="Chọn sản phẩm trong danh mục và gửi yêu cầu đầu tiên." /></GlassCard>
+      ) : (
+        <GlassCard style={{ padding: 0, overflow: "hidden" }}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <TableHeader cols={["Mã yêu cầu","Ngày tạo","Người tạo","Dòng hàng","Giá trị dự kiến","Trạng thái","Thao tác"]} />
+              <tbody>
+                {filtered.map(r => (
+                  <tr key={r.CPRID} className="trow" style={{ borderBottom: "1px solid #F3F4F6" }}>
+                    <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}><IdBadge id={r.CPRID} /></td>
+                    <td style={{ padding: "12px 16px", color: "var(--muted)", whiteSpace: "nowrap" }}>{String(r.CreatedAt || "").slice(0, 10)}</td>
+                    <td style={{ padding: "12px 16px", color: "var(--muted)", whiteSpace: "nowrap" }}>{r.RequestedByName || "—"}</td>
+                    <td style={{ padding: "12px 16px", textAlign: "right" }}>{r.ItemCount || 0}</td>
+                    <td style={{ padding: "12px 16px", textAlign: "right", fontWeight: 600, whiteSpace: "nowrap" }}>{fmtVnd(r.TotalEstimated)}</td>
+                    <td style={{ padding: "12px 16px" }}><StatusBadge status={r.Status} /></td>
+                    <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}>
+                      <button className="btn-ghost" onClick={()=>openDetail(r)} style={{ fontSize: 12, padding: "5px 12px", marginRight: 8 }}>Xem</button>
+                      {role === "org_manager" && ["Draft","Submitted"].includes(r.Status) && (
+                        <button className="btn-danger" onClick={()=>cancel(r)} style={{ fontSize: 12, padding: "5px 12px" }}>Hủy</button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </GlassCard>
+      )}
+      {detail && (
+        <Modal title={`Yêu cầu mua · ${detail.CPRID}`} onClose={()=>setDetail(null)} wide>
+          <div style={{ display: "flex", gap: 18, flexWrap: "wrap", marginBottom: 16, fontSize: 13 }}>
+            <div><StatusBadge status={detail.Status} /></div>
+            <div style={{ color: "var(--muted)" }}>Ngày tạo: {String(detail.CreatedAt || "").slice(0, 16).replace("T", " ")}</div>
+            <div style={{ color: "var(--muted)" }}>Người tạo: {detail.RequestedByName || "—"}</div>
+            <div>Tổng dự kiến: <b>{fmtVnd(detail.TotalEstimated)}</b></div>
+          </div>
+          {detail.Note && <div style={{ fontSize: 13, color: "var(--muted)", marginBottom: 12 }}>Ghi chú: {detail.Note}</div>}
+          {detail.RejectReason && <div style={{ fontSize: 13, color: "#B91C1C", marginBottom: 12 }}>Lý do từ chối: {detail.RejectReason}</div>}
+          <div style={{ overflowX: "auto", border: "1px solid #E5E7EB", borderRadius: 10 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <TableHeader cols={["Dòng","Mã hàng","Sản phẩm","ĐVT","Số lượng","Đơn giá","Thành tiền"]} />
+              <tbody>
+                {(detail.Items || []).map(i => (
+                  <tr key={i.LineNo} style={{ borderBottom: "1px solid #F3F4F6" }}>
+                    <td style={{ padding: "10px 16px", color: "var(--muted)" }}>{i.LineNo}</td>
+                    <td style={{ padding: "10px 16px", whiteSpace: "nowrap" }}><IdBadge id={i.ProductID} /></td>
+                    <td style={{ padding: "10px 16px", fontWeight: 600 }}>{i.ProductName}</td>
+                    <td style={{ padding: "10px 16px", whiteSpace: "nowrap" }}>{i.Unit || unitVi(i)}</td>
+                    <td style={{ padding: "10px 16px", textAlign: "right" }}>{i.Quantity}</td>
+                    <td style={{ padding: "10px 16px", textAlign: "right", whiteSpace: "nowrap" }}>{fmtVnd(i.UnitPrice)}</td>
+                    <td style={{ padding: "10px 16px", textAlign: "right", fontWeight: 600, whiteSpace: "nowrap" }}>{fmtVnd(Number(i.UnitPrice) * Number(i.Quantity))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+            {role === "org_manager" && ["Draft","Submitted"].includes(detail.Status) && (
+              <button className="btn-danger" disabled={busy} onClick={()=>cancel(detail)}>Hủy yêu cầu</button>
+            )}
+            <button className="btn-ghost" onClick={()=>setDetail(null)}>Đóng</button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+};
+
 // ══ APP ═══════════════════════════════════════════════════════════════════════
 const NAV = [
   { id:"dashboard", icon:"◈",  label:"Tổng quan"  },
@@ -2802,24 +4120,48 @@ const NAV = [
   { id:"warehouses",icon:"🏗", label:"Kho hàng" },
   { id:"inventory", icon:"📋", label:"Tồn kho"  },
   { id:"purchaseOrders", icon:"📥", label:"Nhập hàng" },
-  { id:"procurement", icon:"🧾", label:"Mua hàng" },
+  { id:"procurement", icon:"🧾", label:"Mua hàng (PR/PO)" },
+  { id:"cpr",       icon:"📝", label:"Yêu cầu KH (CPR)" },
+  { id:"organizations", icon:"🏢", label:"Tổ chức" },
   { id:"customers", icon:"👥", label:"Khách hàng"  },
   { id:"orders",    icon:"🛒", label:"Đơn hàng"     },
   { id:"returns",   icon:"↩",  label:"Trả hàng" },
   { id:"stocktake", icon:"🧮", label:"Kiểm kê" },
+  { id:"ledger",    icon:"📚", label:"Sổ kho" },
 ];
+const NAV_ORG = [
+  { id:"orgDashboard", icon:"◈", label:"Tổng quan" },
+  { id:"orgProfile",   icon:"🏢", label:"Hồ sơ doanh nghiệp" },
+  { id:"orgCatalog",   icon:"📦", label:"Danh mục sản phẩm" },
+  { id:"orgRequests",  icon:"🧾", label:"Yêu cầu mua hàng" },
+  { id:"orders",       icon:"🛒", label:"Đơn hàng doanh nghiệp" },
+  { id:"returns",      icon:"↩",  label:"Yêu cầu trả hàng" },
+];
+const NAV_ORG_MANAGER = { id:"orgMembers", icon:"👥", label:"Quản lý thành viên" };
 const PAGES = {
   dashboard:Dashboard, suppliers:Suppliers, products:Products, warehouses:Warehouses,
   inventory:Inventory, purchaseOrders:PurchaseOrders, procurement:PurchaseRequisitions,
-  customers:Customers, orders:Orders, returns:Returns, stocktake:Stocktake,
+  customers:Customers, orders:Orders, returns:Returns, stocktake:Stocktake, ledger:Ledger,
+  cpr:CustomerRequests, organizations:Organizations,
+  orgDashboard:OrgDashboard, orgProfile:OrgProfile, orgCatalog:OrgCatalog,
+  orgRequests:OrgRequests, orgMembers:OrgMembers,
 };
+const ORG_ROLE_IDS = ["org_manager", "org_staff"];
 
 export default function App() {
   const initial = bootstrapAuth();
+  const isOrgUser = (u) => Boolean(u) && ORG_ROLE_IDS.includes(u.role);
   const [screen, setScreen] = useState(initial.screen);
   const [user, setUser]         = useState(initial.user);
-  const [page, setPage]     = useState("dashboard");
+  const [page, setPage]     = useState(isOrgUser(initial.user) ? "orgDashboard" : "dashboard");
   const [pendingCount, setPendingCount] = useState(0);
+  const [orgContext, setOrgContext] = useState(null);
+
+  useEffect(() => {
+    if (screen === "app" && isOrgUser(user)) {
+      apiFetch('/organizations/me').then(setOrgContext).catch(() => setOrgContext(null));
+    }
+  }, [screen, user]);
 
   const refreshPending = useCallback(() => {
     apiFetch('/orders').then(orders => {
@@ -2832,7 +4174,9 @@ export default function App() {
   }, [screen, page, refreshPending]);
 
   const handleLogin = (authUser) => {
-    setUser(authUser || { username: "admin", role: "admin" });
+    const next = authUser || { username: "admin", role: "admin" };
+    setUser(next);
+    setPage(isOrgUser(next) ? "orgDashboard" : "dashboard");
     setScreen("app");
   };
 
@@ -2843,6 +4187,7 @@ export default function App() {
     localStorage.removeItem("token");
     clearAuth();
     setUser(null);
+    setPage("dashboard");
     setScreen(targetScreen);
   };
 
@@ -2850,10 +4195,17 @@ export default function App() {
   if (screen === "login")   return <LoginPage onLogin={handleLogin} onCustomerPortal={() => setScreen("customer")} />;
   if (screen === "customer") return <><ToastContainer/><CustomerPortal onBack={() => handleLogout("login")} /></>;
 
-  const Page = PAGES[page];
-  const displayName = user?.username || "admin";
-  const displayRole = user?.role === "customer" ? "Khách hàng" : "Administrator";
-  const displayEmail = `${displayName}@supplychain7vn.vn`;
+  const orgView = isOrgUser(user);
+  const navItems = orgView
+    ? (user?.role === "org_manager" ? [...NAV_ORG, NAV_ORG_MANAGER] : NAV_ORG)
+    : NAV;
+  const activePage = navItems.some(n => n.id === page) ? page : navItems[0].id;
+  const Page = PAGES[activePage] || (orgView ? OrgDashboard : Dashboard);
+  const displayName = user?.full_name || user?.username || "admin";
+  const displayRole = ROLE_VI[user?.role] || "Quản trị viên";
+  const orgName = user?.organization?.OrganizationName || null;
+  const displayOrg = orgName || (user?.organization_id ? `${user.organization_id} · ${displayName}` : "SupplyChain7VN");
+  const displayEmail = `${user?.username || "admin"}@supplychain7vn.vn`;
   return (
     <>
       <ToastContainer />
@@ -2870,25 +4222,40 @@ export default function App() {
           </div>
           <nav style={{ flex:1, padding:"14px 12px", overflowY:"auto" }}>
             <div style={{ fontSize:10, color:"var(--muted)", letterSpacing:2, padding:"0 10px", marginBottom:10 }}>ĐIỀU HƯỚNG</div>
-            {NAV.map(n => (
-              <button key={n.id} onClick={()=>setPage(n.id)} className={`nav-item ${page===n.id?"active":""}`}>
+            {navItems.map(n => (
+              <button key={n.id} onClick={()=>setPage(n.id)} className={`nav-item ${activePage===n.id?"active":""}`}>
                 <span style={{ fontSize:16 }}>{n.icon}</span>
                 <span>{n.label}</span>
                 {n.id === "orders" && pendingCount > 0 && (
                   <span style={{ marginLeft:"auto", background:"#DA251D", borderRadius:8, padding:"1px 7px", fontSize:11, color:"#fff" }}>{pendingCount}</span>
                 )}
-                {page===n.id && n.id !== "orders" && <span style={{ marginLeft:"auto", color:"#DA251D", fontWeight:700 }}>›</span>}
+                {activePage===n.id && n.id !== "orders" && <span style={{ marginLeft:"auto", color:"#DA251D", fontWeight:700 }}>›</span>}
               </button>
             ))}
           </nav>
           <div style={{ padding:"16px 18px", borderTop:"1px solid #E5E7EB", display:"flex", alignItems:"center", gap:10 }}>
             <div style={{ width:36, height:36, background:"#DA251D", borderRadius:10, display:"flex", alignItems:"center", justifyContent:"center", fontSize:16, flexShrink:0 }}>👤</div>
-            <div><div style={{ fontSize:14, fontWeight:600 }}>{displayName}</div><div style={{ fontSize:10, color:"var(--muted)" }}>{displayRole} · {displayEmail}</div></div>
+            <div style={{ minWidth:0 }}><div style={{ fontSize:14, fontWeight:600, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{displayName}</div><div style={{ fontSize:10, color:"var(--muted)", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }} title={displayEmail}>{displayRole}{orgView ? ` · ${displayOrg}` : ""}</div></div>
             <button onClick={() => handleLogout("landing")} style={{ marginLeft:"auto", background:"#FFFFFF", border:"1px solid #FECACA", color:"#B91C1C", cursor:"pointer", borderRadius:8, width:30, height:30, fontSize:14, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>⏻</button>
           </div>
         </div>
         <div style={{ marginLeft:230, flex:1, padding:36, background:"#F5F7FA", maxWidth:"calc(100vw - 230px)", minHeight:"100vh" }}>
-          <Page key={page} refreshPending={refreshPending}/>
+          {orgView && (
+            <div className="glass" style={{ padding:"14px 20px", marginBottom:20, display:"flex", flexWrap:"wrap", gap:"14px 24px", alignItems:"center", borderLeft:"3px solid #DA251D" }}>
+              <div>
+                <div style={{ fontFamily:"var(--font-head)", fontSize:16, fontWeight:700 }}>{orgContext?.OrganizationName || orgName || "Doanh nghiệp"}</div>
+                <div style={{ fontSize:12, color:"var(--muted)", marginTop:3 }}>
+                  MST: {orgContext?.TaxCode || "—"} · Mã khách hàng doanh nghiệp: {orgContext?.CustomerID || "—"}
+                </div>
+              </div>
+              <div style={{ borderLeft:"1px solid #E5E7EB", paddingLeft:24 }}>
+                <div style={{ fontSize:13, fontWeight:600 }}>Người dùng: {displayName}</div>
+                <div style={{ fontSize:12, color:"var(--muted)", marginTop:3 }}>Vai trò: {displayRole}</div>
+              </div>
+              <div style={{ marginLeft:"auto", fontSize:11, color:"var(--muted)", letterSpacing:1.5 }}>CỔNG GIAO DỊCH B2B</div>
+            </div>
+          )}
+          <Page key={activePage} refreshPending={refreshPending} role={user?.role}/>
         </div>
       </div>
     </>
