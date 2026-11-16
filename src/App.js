@@ -108,6 +108,19 @@ const getToken = () => localStorage.getItem("token");
 const AUTH_KEY = "auth";
 const CUSTOMER_KEY = "customer";
 
+// ── Vai trò (RBAC) ───────────────────────────────────────────────────────────
+// Nguồn sự thật: claim "role" trong JWT do backend cấp (backend/app.py: auth_login).
+// KHÔNG bao giờ mặc định về "admin" khi thiếu role — đó là lỗi khiến tài khoản
+// doanh nghiệp rơi vào giao diện Admin.
+const ADMIN_ROLE_IDS = ["admin"];
+const ORG_ROLE_IDS   = ["org_manager", "org_staff"];
+const normalizeRole  = (role) => String(role ?? "").trim().toLowerCase();
+const isAdminRole    = (role) => ADMIN_ROLE_IDS.includes(normalizeRole(role));
+const isOrgRole      = (role) => ORG_ROLE_IDS.includes(normalizeRole(role));
+const isKnownRole    = (role) => isAdminRole(role) || isOrgRole(role) || normalizeRole(role) === "customer";
+// Trang mặc định sau đăng nhập: org_* -> Organization Portal, admin -> Dashboard
+const homePageFor    = (role) => (isOrgRole(role) ? "orgDashboard" : "dashboard");
+
 const decodeJwt = (token) => {
   try {
     const base64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
@@ -135,7 +148,7 @@ const setAuth = (screen, extra = {}) => {
   const auth = {
     screen,
     username: extra.username || p.username || p.sub || "",
-    role: extra.role || p.role || "admin",
+    role: normalizeRole(extra.role || p.role),
     full_name: extra.full_name || p.full_name || "",
     organization_id: extra.organization_id !== undefined ? extra.organization_id : (p.organization_id ?? null),
     customer_id: extra.customer_id !== undefined ? extra.customer_id : (p.customer_id ?? null),
@@ -154,17 +167,22 @@ const clearAuth = () => {
 };
 const bootstrapAuth = () => {
   if (!hasValidToken()) return { screen: "landing", user: null };
-  const auth = getAuth() || {};
+  const cached = getAuth() || {};
   const p = decodeJwt(getToken()) || {};
+  // JWT là nguồn sự thật cho role/organization_id/customer_id.
+  // localStorage chỉ dùng cho dữ liệu hiển thị (tên, organization đã cache).
+  const role = normalizeRole(p.role || cached.role);
+  if (!isKnownRole(role)) return { screen: "landing", user: null };
   const user = {
-    username: auth.username || p.username || p.sub || "admin",
-    role: auth.role || p.role || "admin",
-    full_name: auth.full_name || p.full_name || "",
-    organization_id: auth.organization_id ?? p.organization_id ?? null,
-    customer_id: auth.customer_id ?? p.customer_id ?? null,
-    organization: auth.organization || null,
+    username: cached.username || p.username || p.sub || "",
+    role,
+    full_name: cached.full_name || p.full_name || "",
+    organization_id: p.organization_id ?? cached.organization_id ?? null,
+    customer_id: p.customer_id ?? cached.customer_id ?? null,
+    organization: cached.organization || null,
   };
-  const screen = ["app", "login", "customer"].includes(auth.screen) ? auth.screen : "app";
+  if (role === "customer") return { screen: "customer", user };
+  const screen = ["app", "login"].includes(cached.screen) ? cached.screen : "app";
   return { screen, user };
 };
 
@@ -4138,6 +4156,15 @@ const NAV_ORG = [
   { id:"returns",      icon:"↩",  label:"Yêu cầu trả hàng" },
 ];
 const NAV_ORG_MANAGER = { id:"orgMembers", icon:"👥", label:"Quản lý thành viên" };
+
+// Menu theo role — 1 nguồn duy nhất, dùng cho cả sidebar và guard điều hướng.
+const navForRole = (role) => {
+  if (isOrgRole(role)) {
+    return normalizeRole(role) === "org_manager" ? [...NAV_ORG, NAV_ORG_MANAGER] : NAV_ORG;
+  }
+  if (isAdminRole(role)) return NAV;
+  return [];
+};
 const PAGES = {
   dashboard:Dashboard, suppliers:Suppliers, products:Products, warehouses:Warehouses,
   inventory:Inventory, purchaseOrders:PurchaseOrders, procurement:PurchaseRequisitions,
@@ -4146,22 +4173,57 @@ const PAGES = {
   orgDashboard:OrgDashboard, orgProfile:OrgProfile, orgCatalog:OrgCatalog,
   orgRequests:OrgRequests, orgMembers:OrgMembers,
 };
-const ORG_ROLE_IDS = ["org_manager", "org_staff"];
-
 export default function App() {
   const initial = bootstrapAuth();
-  const isOrgUser = (u) => Boolean(u) && ORG_ROLE_IDS.includes(u.role);
   const [screen, setScreen] = useState(initial.screen);
   const [user, setUser]         = useState(initial.user);
-  const [page, setPage]     = useState(isOrgUser(initial.user) ? "orgDashboard" : "dashboard");
+  const [page, setPage]     = useState(homePageFor(initial.user?.role));
   const [pendingCount, setPendingCount] = useState(0);
   const [orgContext, setOrgContext] = useState(null);
 
   useEffect(() => {
-    if (screen === "app" && isOrgUser(user)) {
+    if (screen === "app" && isOrgRole(user?.role)) {
       apiFetch('/organizations/me').then(setOrgContext).catch(() => setOrgContext(null));
     }
   }, [screen, user]);
+
+  // Đối chiếu role với server (/auth/me): localStorage cũ có thể còn role "admin"
+  // trong khi JWT/DB là org_manager => UI sẽ hiện nhầm sidebar Admin.
+  useEffect(() => {
+    if (screen !== "app") return undefined;
+    let cancelled = false;
+    apiFetch('/auth/me')
+      .then(me => {
+        if (cancelled || !me) return;
+        const serverRole = normalizeRole(me.Role || me.role);
+        if (!isKnownRole(serverRole)) return;
+        if (serverRole === normalizeRole(user?.role)) return;
+        setUser(u => ({ ...(u || {}), role: serverRole, full_name: me.FullName || u?.full_name || "" }));
+        setPage(homePageFor(serverRole));
+        setAuth("app", { role: serverRole });
+        if (serverRole === "customer") setScreen("customer");
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screen]);
+
+  // Tự chữa localStorage: role đã cache mà lệch claim trong JWT thì ghi lại theo JWT.
+  useEffect(() => {
+    const cached = getAuth();
+    const tokenRole = normalizeRole(decodeJwt(getToken())?.role);
+    if (cached && tokenRole && normalizeRole(cached.role) !== tokenRole) {
+      setAuth("app", { role: tokenRole });
+    }
+  }, []);
+
+  // Guard: không cho một role đứng ở trang không thuộc menu của role đó.
+  useEffect(() => {
+    if (screen !== "app") return;
+    const role = user?.role;
+    if (!isAdminRole(role) && !isOrgRole(role)) return;
+    if (!navForRole(role).some(n => n.id === page)) setPage(homePageFor(role));
+  }, [screen, page, user?.role]);
 
   const refreshPending = useCallback(() => {
     apiFetch('/orders').then(orders => {
@@ -4173,11 +4235,35 @@ export default function App() {
     if (screen === "app") refreshPending();
   }, [screen, page, refreshPending]);
 
+  // Điều hướng sau đăng nhập — tuyệt đối không mặc định về Admin.
   const handleLogin = (authUser) => {
-    const next = authUser || { username: "admin", role: "admin" };
-    setUser(next);
-    setPage(isOrgUser(next) ? "orgDashboard" : "dashboard");
-    setScreen("app");
+    const role = normalizeRole(authUser?.role);
+    const next = { ...(authUser || {}), role };
+
+    if (isOrgRole(role)) {            // org_manager / org_staff -> Organization Portal
+      setUser(next);
+      setPage("orgDashboard");
+      setScreen("app");
+      return;
+    }
+    if (isAdminRole(role)) {          // admin -> Dashboard quản trị
+      setUser(next);
+      setPage("dashboard");
+      setScreen("app");
+      return;
+    }
+    if (role === "customer") {        // customer -> cổng khách hàng
+      setUser(next);
+      setScreen("customer");
+      return;
+    }
+    // Token/role không hợp lệ: không cấp shell Admin.
+    localStorage.removeItem("token");
+    clearAuth();
+    setUser(null);
+    setPage("dashboard");
+    setScreen("landing");
+    showToast("Tài khoản chưa được gán vai trò hợp lệ.", "error");
   };
 
   const handleLogout = async (targetScreen = "landing") => {
@@ -4191,14 +4277,17 @@ export default function App() {
     setScreen(targetScreen);
   };
 
+  const orgView = isOrgRole(user?.role);
+  const adminView = isAdminRole(user?.role);
+  const navItems = navForRole(user?.role);
+
   if (screen === "landing") return <LandingPage onEnter={() => setScreen("login")}/>;
   if (screen === "login")   return <LoginPage onLogin={handleLogin} onCustomerPortal={() => setScreen("customer")} />;
   if (screen === "customer") return <><ToastContainer/><CustomerPortal onBack={() => handleLogout("login")} /></>;
-
-  const orgView = isOrgUser(user);
-  const navItems = orgView
-    ? (user?.role === "org_manager" ? [...NAV_ORG, NAV_ORG_MANAGER] : NAV_ORG)
-    : NAV;
+  // Role không có menu hợp lệ thì không render shell Admin (chống lộ giao diện).
+  if (!navItems.length || !(orgView || adminView)) {
+    return <LandingPage onEnter={() => setScreen("login")}/>;
+  }
   const activePage = navItems.some(n => n.id === page) ? page : navItems[0].id;
   const Page = PAGES[activePage] || (orgView ? OrgDashboard : Dashboard);
   const displayName = user?.full_name || user?.username || "admin";
